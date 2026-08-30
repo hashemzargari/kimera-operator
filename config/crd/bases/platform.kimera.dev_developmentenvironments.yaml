@@ -17,8 +17,8 @@ spec:
   - name: v1alpha1
     schema:
       openAPIV3Schema:
-        description: DevelopmentEnvironment is the Schema for the developmentenvironments
-          API
+        description: DevelopmentEnvironment is the Schema for a managed, persistent
+          IDE environment.
         properties:
           apiVersion:
             description: |-
@@ -38,29 +38,75 @@ spec:
           metadata:
             type: object
           spec:
-            description: spec defines the desired state of DevelopmentEnvironment
+            description: Spec defines the desired environment.
             properties:
               configMapRef:
-                type: string
+                description: ConfigMapRef, when set, is injected into the container
+                  with envFrom.
+                properties:
+                  name:
+                    default: ""
+                    description: |-
+                      Name of the referent.
+                      This field is effectively required, but due to backwards compatibility is
+                      allowed to be empty. Instances of this type with an empty value here are
+                      almost certainly wrong.
+                      More info: https://kubernetes.io/docs/concepts/overview/working-with-objects/names/#names
+                    type: string
+                type: object
+                x-kubernetes-map-type: atomic
               image:
+                description: Image is the container image for the IDE workload.
+                maxLength: 512
+                minLength: 1
                 type: string
               network:
+                description: Network configures optional ingress. It defaults to disabled.
                 properties:
                   enabled:
+                    description: Enabled creates an Ingress when true.
                     type: boolean
                   host:
+                    description: Host is the DNS host served by the Ingress.
+                    maxLength: 253
+                    pattern: ^([a-z0-9]([-a-z0-9]*[a-z0-9])?)(\\.([a-z0-9]([-a-z0-9]*[a-z0-9])?))*$
                     type: string
                 type: object
               resources:
+                description: Resources configures compute resources for the IDE container.
                 properties:
                   cpuLimit:
-                    type: string
+                    anyOf:
+                    - type: integer
+                    - type: string
+                    description: CPULimit is the maximum CPU capacity, for example
+                      "2".
+                    pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
+                    x-kubernetes-int-or-string: true
                   cpuRequest:
-                    type: string
+                    anyOf:
+                    - type: integer
+                    - type: string
+                    description: CPURequest is the requested CPU capacity, for example
+                      "500m".
+                    pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
+                    x-kubernetes-int-or-string: true
                   memoryLimit:
-                    type: string
+                    anyOf:
+                    - type: integer
+                    - type: string
+                    description: MemoryLimit is the maximum memory capacity, for example
+                      "4Gi".
+                    pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
+                    x-kubernetes-int-or-string: true
                   memoryRequest:
-                    type: string
+                    anyOf:
+                    - type: integer
+                    - type: string
+                    description: MemoryRequest is the requested memory capacity, for
+                      example "1Gi".
+                    pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
+                    x-kubernetes-int-or-string: true
                 required:
                 - cpuLimit
                 - cpuRequest
@@ -68,16 +114,51 @@ spec:
                 - memoryRequest
                 type: object
               secretRefs:
+                description: SecretRefs are injected into the container with envFrom.
+                  Values are never stored in status or logs.
                 items:
-                  type: string
+                  description: |-
+                    LocalObjectReference contains enough information to let you locate the
+                    referenced object inside the same namespace.
+                  properties:
+                    name:
+                      default: ""
+                      description: |-
+                        Name of the referent.
+                        This field is effectively required, but due to backwards compatibility is
+                        allowed to be empty. Instances of this type with an empty value here are
+                        almost certainly wrong.
+                        More info: https://kubernetes.io/docs/concepts/overview/working-with-objects/names/#names
+                      type: string
+                  type: object
+                  x-kubernetes-map-type: atomic
                 type: array
+                x-kubernetes-list-map-keys:
+                - name
+                x-kubernetes-list-type: map
               storage:
+                description: Storage configures the environment's persistent workspace.
                 properties:
                   retentionPolicy:
+                    default: Retain
+                    description: RetentionPolicy controls whether the PVC is deleted
+                      with this resource.
+                    enum:
+                    - Retain
+                    - Delete
                     type: string
                   size:
-                    type: string
+                    anyOf:
+                    - type: integer
+                    - type: string
+                    description: Size is the requested persistent storage capacity,
+                      for example "10Gi".
+                    pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
+                    x-kubernetes-int-or-string: true
                   storageClassName:
+                    description: StorageClassName selects a StorageClass. Empty uses
+                      the cluster default.
+                    maxLength: 253
                     type: string
                 required:
                 - size
@@ -87,20 +168,15 @@ spec:
             - resources
             - storage
             type: object
+            x-kubernetes-validations:
+            - message: network.host is required when network.enabled is true
+              rule: '!self.network.enabled || self.network.host != ”'
           status:
-            description: status defines the observed state of DevelopmentEnvironment
+            description: Status defines the observed environment state.
             properties:
               conditions:
-                description: |-
-                  conditions represent the current state of the DevelopmentEnvironment resource.
-                  Each condition has a unique type and reflects the status of a specific aspect of the resource.
-
-                  Standard condition types include:
-                  - "Available": the resource is fully functional
-                  - "Progressing": the resource is being created or updated
-                  - "Degraded": the resource failed to reach or maintain its desired state
-
-                  The status of each condition is one of True, False, or Unknown.
+                description: Conditions describe readiness of storage, workload, network,
+                  and overall progress.
                 items:
                   description: Condition contains details for one aspect of the current
                     state of this API Resource.
@@ -160,11 +236,17 @@ spec:
                 - type
                 x-kubernetes-list-type: map
               environmentURL:
+                description: EnvironmentURL is the HTTPS URL served by the managed
+                  Ingress, when enabled.
                 type: string
               observedGeneration:
+                description: ObservedGeneration is the most recent generation processed
+                  by the controller.
                 format: int64
                 type: integer
               phase:
+                description: Phase is the high-level lifecycle state reported by the
+                  controller.
                 type: string
             type: object
         required:

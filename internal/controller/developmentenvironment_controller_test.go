@@ -21,7 +21,9 @@ import (
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
+	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/resource"
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
@@ -49,14 +51,18 @@ var _ = Describe("DevelopmentEnvironment Controller", func() {
 			By("creating the custom resource for the Kind DevelopmentEnvironment")
 			err := k8sClient.Get(ctx, typeNamespacedName, developmentenvironment)
 			if err != nil && errors.IsNotFound(err) {
-				resource := &platformv1alpha1.DevelopmentEnvironment{
+				environment := &platformv1alpha1.DevelopmentEnvironment{
 					ObjectMeta: metav1.ObjectMeta{
 						Name:      resourceName,
 						Namespace: resourceNamespace,
 					},
-					// TODO(user): Specify other spec details if needed.
+					Spec: platformv1alpha1.DevelopmentEnvironmentSpec{
+						Image:     "example.invalid/code-server:v1",
+						Resources: platformv1alpha1.ResourceSpec{CPURequest: resource.MustParse("100m"), CPULimit: resource.MustParse("1"), MemoryRequest: resource.MustParse("128Mi"), MemoryLimit: resource.MustParse("512Mi")},
+						Storage:   platformv1alpha1.StorageSpec{Size: resource.MustParse("1Gi"), RetentionPolicy: "Retain"},
+					},
 				}
-				Expect(k8sClient.Create(ctx, resource)).To(Succeed())
+				Expect(k8sClient.Create(ctx, environment)).To(Succeed())
 			}
 		})
 
@@ -80,8 +86,11 @@ var _ = Describe("DevelopmentEnvironment Controller", func() {
 				NamespacedName: typeNamespacedName,
 			})
 			Expect(err).NotTo(HaveOccurred())
-			// TODO(user): Add more specific assertions depending on your controller's reconciliation logic.
-			// Example: If you expect a certain status condition after reconciliation, verify it here.
+			// The first pass adds the finalizer; the second creates child resources.
+			_, err = controllerReconciler.Reconcile(ctx, reconcile.Request{NamespacedName: typeNamespacedName})
+			Expect(err).NotTo(HaveOccurred())
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: resourceName + "-workspace", Namespace: resourceNamespace}, &corev1.PersistentVolumeClaim{})).To(Succeed())
+			Expect(k8sClient.Get(ctx, typeNamespacedName, &corev1.Service{})).To(Succeed())
 		})
 	})
 })

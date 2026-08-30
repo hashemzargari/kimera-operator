@@ -4,6 +4,18 @@ metadata:
   labels:
     app.kubernetes.io/name: kimera-operator
     app.kubernetes.io/managed-by: kustomize
-  name: developmentenvironment-sample
+  name: team-a
 spec:
-  # TODO(user): Add fields here
+  image: ghcr.io/example/code-server:v0
+  resources:
+    cpuRequest: 500m
+    cpuLimit: "2"
+    memoryRequest: 1Gi
+    memoryLimit: 4Gi
+  storage:
+    size: 10Gi
+    storageClassName: local-path
+    retentionPolicy: Retain
+  network:
+    enabled: true
+    host: team-a.kimera.local
