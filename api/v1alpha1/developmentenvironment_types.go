@@ -76,7 +76,7 @@ type NetworkSpec struct {
 	Enabled bool `json:"enabled,omitempty"`
 	// Host is the DNS host served by the Ingress.
 	// +kubebuilder:validation:MaxLength=253
-// +kubebuilder:validation:Pattern=`^([a-z0-9]([-a-z0-9]*[a-z0-9])?)(\.([a-z0-9]([-a-z0-9]*[a-z0-9])?))*$`
+	// +kubebuilder:validation:Pattern=`^([a-z0-9]([-a-z0-9]*[a-z0-9])?)(\.([a-z0-9]([-a-z0-9]*[a-z0-9])?))*$`
 	Host string `json:"host,omitempty"`
 }
 
