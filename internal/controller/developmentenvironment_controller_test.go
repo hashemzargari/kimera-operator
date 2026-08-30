@@ -31,6 +31,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	platformv1alpha1 "github.com/hashemzargari/kimera-operator/api/v1alpha1"
+	"github.com/hashemzargari/kimera-operator/internal/naming"
 )
 
 var _ = Describe("DevelopmentEnvironment Controller", func() {
@@ -90,7 +91,9 @@ var _ = Describe("DevelopmentEnvironment Controller", func() {
 			// The first pass adds the finalizer; the second creates child resources.
 			_, err = controllerReconciler.Reconcile(ctx, reconcile.Request{NamespacedName: typeNamespacedName})
 			Expect(err).NotTo(HaveOccurred())
-			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: resourceName + "-workspace", Namespace: resourceNamespace}, &corev1.PersistentVolumeClaim{})).To(Succeed())
+			current := &platformv1alpha1.DevelopmentEnvironment{}
+			Expect(k8sClient.Get(ctx, typeNamespacedName, current)).To(Succeed())
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: naming.PVC(current), Namespace: resourceNamespace}, &corev1.PersistentVolumeClaim{})).To(Succeed())
 			Expect(k8sClient.Get(ctx, typeNamespacedName, &corev1.Service{})).To(Succeed())
 		})
 	})

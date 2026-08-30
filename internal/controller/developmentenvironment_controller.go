@@ -17,6 +17,7 @@ import (
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
+	crlog "sigs.k8s.io/controller-runtime/pkg/log"
 
 	platformv1alpha1 "github.com/hashemzargari/kimera-operator/api/v1alpha1"
 	"github.com/hashemzargari/kimera-operator/internal/naming"
@@ -47,13 +48,24 @@ func (r *DevelopmentEnvironmentReconciler) Reconcile(ctx context.Context, req ct
 	if err := r.Get(ctx, req.NamespacedName, env); err != nil {
 		return ctrl.Result{}, client.IgnoreNotFound(err)
 	}
+	logger := ctrl.LoggerFrom(ctx).WithValues(
+		"developmentEnvironment", env.Name,
+		"namespace", env.Namespace,
+		"generation", env.Generation,
+	)
+	ctx = crlog.IntoContext(ctx, logger)
+	logger.V(2).Info("Reconciling DevelopmentEnvironment")
 	if !env.DeletionTimestamp.IsZero() {
 		return r.reconcileDelete(ctx, env)
 	}
 	if !controllerutil.ContainsFinalizer(env, finalizer) {
 		before := env.DeepCopy()
 		controllerutil.AddFinalizer(env, finalizer)
-		return ctrl.Result{}, r.patchParent(ctx, env, before, "add finalizer")
+		if err := r.patchParent(ctx, env, before, "add finalizer"); err != nil {
+			return ctrl.Result{}, err
+		}
+		logger.Info("Added DevelopmentEnvironment finalizer")
+		return ctrl.Result{}, nil
 	}
 
 	before := env.DeepCopy()
@@ -84,8 +96,7 @@ func (r *DevelopmentEnvironmentReconciler) Reconcile(ctx context.Context, req ct
 		return ctrl.Result{}, fmt.Errorf("delete disabled Ingress: %w", err)
 	}
 
-	wasReady := before.Status.Phase == platformv1alpha1.PhaseReady || before.Status.Phase == platformv1alpha1.PhaseDegraded
-	if err := r.setReadiness(ctx, env, wasReady, refsReady, refsMessage); err != nil {
+	if err := r.setReadiness(ctx, env, before.Status.Phase, refsReady, refsMessage); err != nil {
 		return ctrl.Result{}, err
 	}
 	return ctrl.Result{}, r.writeStatus(ctx, before, env)
@@ -131,6 +142,10 @@ func deletePVC(env *platformv1alpha1.DevelopmentEnvironment) bool {
 // reconcilePVC changes only the storage request. PVCs cannot be shrunk, and StorageClass is
 // intentionally immutable after creation because changing it would require a replacement claim.
 func (r *DevelopmentEnvironmentReconciler) reconcilePVC(ctx context.Context, env *platformv1alpha1.DevelopmentEnvironment) error {
+	logger := ctrl.LoggerFrom(ctx)
+	if env.UID == "" {
+		return &specError{"metadata.uid is required to derive a safe workspace storage identity"}
+	}
 	desired := resources.DesiredPVC(env)
 	existing := &corev1.PersistentVolumeClaim{}
 	err := r.Get(ctx, client.ObjectKeyFromObject(desired), existing)
@@ -140,33 +155,87 @@ func (r *DevelopmentEnvironmentReconciler) reconcilePVC(ctx context.Context, env
 				return err
 			}
 		}
-		return r.Create(ctx, desired)
+		if err := r.Create(ctx, desired); err != nil {
+			return fmt.Errorf("create workspace PVC: %w", err)
+		}
+		logger.Info("Created workspace PVC",
+			"pvc", desired.Name,
+			"retentionPolicy", env.Spec.Storage.RetentionPolicy,
+			"requestedSize", env.Spec.Storage.Size.String(),
+			"storageClass", env.Spec.Storage.StorageClassName,
+			"storageIdentity", naming.StorageIdentity(env),
+		)
+		return nil
 	}
 	if err != nil {
 		return fmt.Errorf("get PVC: %w", err)
 	}
+	if err := validatePVCIdentityAndCompatibility(existing, desired, env); err != nil {
+		logger.Info("Incompatible workspace PVC detected",
+			"pvc", existing.Name,
+			"storageIdentity", naming.StorageIdentity(env),
+			"reason", err.Error(),
+		)
+		return err
+	}
 	current := existing.Spec.Resources.Requests[corev1.ResourceStorage]
 	if env.Spec.Storage.Size.Cmp(current) < 0 {
-		return &specError{fmt.Sprintf("requested storage %s is smaller than existing PVC size %s; shrinking is unsupported", env.Spec.Storage.Size.String(), current.String())}
+		err := &specError{fmt.Sprintf("requested storage %s is smaller than existing PVC size %s; shrinking is unsupported", env.Spec.Storage.Size.String(), current.String())}
+		logger.Info("Incompatible workspace PVC detected", "pvc", existing.Name, "storageIdentity", naming.StorageIdentity(env), "reason", err.Error())
+		return err
 	}
 	before := existing.DeepCopy()
+	ownershipChanged := false
 	if !deletePVC(env) && metav1.IsControlledBy(existing, env) {
 		if err := controllerutil.RemoveControllerReference(env, existing, r.Scheme); err != nil {
 			return fmt.Errorf("remove PVC controller reference: %w", err)
 		}
+		ownershipChanged = true
 	}
 	if deletePVC(env) && !metav1.IsControlledBy(existing, env) {
 		if err := controllerutil.SetControllerReference(env, existing, r.Scheme); err != nil {
 			return fmt.Errorf("set PVC controller reference: %w", err)
 		}
+		ownershipChanged = true
 	}
-	if env.Spec.Storage.Size.Cmp(current) > 0 {
+	expanded := env.Spec.Storage.Size.Cmp(current) > 0
+	if expanded {
 		existing.Spec.Resources.Requests[corev1.ResourceStorage] = env.Spec.Storage.Size
 	}
-	if !equality.Semantic.DeepEqual(before.ObjectMeta.OwnerReferences, existing.ObjectMeta.OwnerReferences) || env.Spec.Storage.Size.Cmp(current) > 0 {
+	if ownershipChanged || expanded {
 		if err := r.Patch(ctx, existing, client.MergeFrom(before)); err != nil {
 			return fmt.Errorf("patch PVC: %w", err)
 		}
+		if ownershipChanged {
+			logger.Info("Updated workspace PVC controller ownership", "pvc", existing.Name, "retentionPolicy", env.Spec.Storage.RetentionPolicy, "storageIdentity", naming.StorageIdentity(env))
+		}
+		if expanded {
+			logger.Info("Expanded workspace PVC", "pvc", existing.Name, "previousSize", current.String(), "requestedSize", env.Spec.Storage.Size.String(), "storageIdentity", naming.StorageIdentity(env))
+		}
+	} else {
+		logger.V(2).Info("Workspace PVC for current storage identity is already reconciled", "pvc", existing.Name, "storageIdentity", naming.StorageIdentity(env))
+	}
+	return nil
+}
+
+func validatePVCIdentityAndCompatibility(existing, desired *corev1.PersistentVolumeClaim, env *platformv1alpha1.DevelopmentEnvironment) error {
+	identity := naming.StorageIdentity(env)
+	if existing.Labels[naming.ManagedByLabel] != naming.ManagedByValue ||
+		existing.Labels[naming.EnvironmentUIDLabel] != identity ||
+		existing.Annotations[naming.OriginalEnvironmentUIDAnnotation] != identity ||
+		existing.Annotations[naming.StorageIdentityAnnotation] != identity ||
+		existing.Annotations[naming.OriginalEnvironmentNameAnnotation] != env.Name {
+		return &specError{fmt.Sprintf("PVC %q does not have provenance for DevelopmentEnvironment UID %q; refusing automatic adoption", existing.Name, identity)}
+	}
+	if env.Spec.Storage.StorageClassName != "" && (existing.Spec.StorageClassName == nil || *existing.Spec.StorageClassName != env.Spec.Storage.StorageClassName) {
+		actual := ""
+		if existing.Spec.StorageClassName != nil {
+			actual = *existing.Spec.StorageClassName
+		}
+		return &specError{fmt.Sprintf("PVC %q uses storageClassName %q, requested %q; storageClassName is immutable", existing.Name, actual, env.Spec.Storage.StorageClassName)}
+	}
+	if !equality.Semantic.DeepEqual(existing.Spec.AccessModes, desired.Spec.AccessModes) {
+		return &specError{fmt.Sprintf("PVC %q access modes %v do not match required access modes %v", existing.Name, existing.Spec.AccessModes, desired.Spec.AccessModes)}
 	}
 	return nil
 }
@@ -176,7 +245,7 @@ func (r *DevelopmentEnvironmentReconciler) reconcileOwned(ctx context.Context, e
 	// Apply the same built-in Kubernetes defaults the API server applies. Without this,
 	// each reconcile can clear defaulted PodTemplate fields that the API server restores.
 	r.Scheme.Default(expected)
-	_, err := controllerutil.CreateOrPatch(ctx, r.Client, desired, func() error {
+	operation, err := controllerutil.CreateOrPatch(ctx, r.Client, desired, func() error {
 		labels := desired.GetLabels()
 		if labels == nil {
 			labels = map[string]string{}
@@ -204,10 +273,37 @@ func (r *DevelopmentEnvironmentReconciler) reconcileOwned(ctx context.Context, e
 		}
 		return controllerutil.SetControllerReference(env, desired, r.Scheme)
 	})
+	if err != nil {
+		return err
+	}
+	kind := childKind(desired)
+	switch operation {
+	case controllerutil.OperationResultCreated:
+		ctrl.LoggerFrom(ctx).Info("Created managed child resource", "kind", kind, "name", desired.GetName())
+	case controllerutil.OperationResultUpdated, controllerutil.OperationResultUpdatedStatus, controllerutil.OperationResultUpdatedStatusOnly:
+		ctrl.LoggerFrom(ctx).Info("Patched managed child resource", "kind", kind, "name", desired.GetName())
+	default:
+		ctrl.LoggerFrom(ctx).V(2).Info("Managed child resource is unchanged", "kind", kind, "name", desired.GetName())
+	}
 	return err
 }
 
-func (r *DevelopmentEnvironmentReconciler) setReadiness(ctx context.Context, env *platformv1alpha1.DevelopmentEnvironment, wasReady, refsReady bool, refsMessage string) error {
+func childKind(object client.Object) string {
+	switch object.(type) {
+	case *appsv1.Deployment:
+		return "Deployment"
+	case *corev1.Service:
+		return "Service"
+	case *networkingv1.Ingress:
+		return "Ingress"
+	case *corev1.PersistentVolumeClaim:
+		return "PersistentVolumeClaim"
+	default:
+		return fmt.Sprintf("%T", object)
+	}
+}
+
+func (r *DevelopmentEnvironmentReconciler) setReadiness(ctx context.Context, env *platformv1alpha1.DevelopmentEnvironment, previousPhase platformv1alpha1.DevelopmentEnvironmentPhase, refsReady bool, refsMessage string) error {
 	pvc := &corev1.PersistentVolumeClaim{}
 	if err := r.Get(ctx, types.NamespacedName{Namespace: env.Namespace, Name: naming.PVC(env)}, pvc); err != nil && !apierrors.IsNotFound(err) {
 		return fmt.Errorf("observe PVC: %w", err)
@@ -259,16 +355,23 @@ func (r *DevelopmentEnvironmentReconciler) setReadiness(ctx context.Context, env
 		env.Status.Phase = platformv1alpha1.PhaseReady
 		statusutil.Set(env, statusutil.Ready, metav1.ConditionTrue, "ResourcesReady", "DevelopmentEnvironment is ready")
 		statusutil.Set(env, statusutil.Progressing, metav1.ConditionFalse, "Reconciled", "Desired resources are ready")
+		if previousPhase != platformv1alpha1.PhaseReady {
+			ctrl.LoggerFrom(ctx).Info("DevelopmentEnvironment became Ready", "storageReady", storageReady, "workloadReady", workloadReady, "networkReady", networkReady)
+		}
 		return nil
 	}
 	message := "Waiting for PVC, Deployment, Service, or Ingress readiness"
 	if !refsReady {
 		message = refsMessage
 	}
+	wasReady := previousPhase == platformv1alpha1.PhaseReady || previousPhase == platformv1alpha1.PhaseDegraded
 	if wasReady {
 		env.Status.Phase = platformv1alpha1.PhaseDegraded
 		statusutil.Set(env, statusutil.Ready, metav1.ConditionFalse, "HealthLost", message)
 		statusutil.Set(env, statusutil.Progressing, metav1.ConditionFalse, "Degraded", message)
+		if previousPhase == platformv1alpha1.PhaseReady {
+			ctrl.LoggerFrom(ctx).Info("DevelopmentEnvironment left Ready state", "storageReady", storageReady, "workloadReady", workloadReady, "networkReady", networkReady)
+		}
 	} else {
 		env.Status.Phase = platformv1alpha1.PhaseProvisioning
 		statusutil.Set(env, statusutil.Ready, metav1.ConditionFalse, "Provisioning", message)
@@ -303,12 +406,15 @@ func (r *DevelopmentEnvironmentReconciler) recordInvalidSpec(ctx context.Context
 }
 
 func (r *DevelopmentEnvironmentReconciler) reconcileDelete(ctx context.Context, env *platformv1alpha1.DevelopmentEnvironment) (ctrl.Result, error) {
+	logger := ctrl.LoggerFrom(ctx)
+	logger.V(1).Info("Reconciling DevelopmentEnvironment deletion", "retentionPolicy", env.Spec.Storage.RetentionPolicy)
 	if !deletePVC(env) {
 		pvc := resources.DesiredPVC(env)
 		existing := &corev1.PersistentVolumeClaim{}
 		if err := r.Get(ctx, client.ObjectKeyFromObject(pvc), existing); err != nil && !apierrors.IsNotFound(err) {
 			return ctrl.Result{}, err
 		} else if err == nil && metav1.IsControlledBy(existing, env) {
+			logger.Info("Retaining workspace PVC", "pvc", existing.Name, "storageIdentity", naming.StorageIdentity(env))
 			before := existing.DeepCopy()
 			if err := controllerutil.RemoveControllerReference(env, existing, r.Scheme); err != nil {
 				return ctrl.Result{}, err
@@ -317,7 +423,11 @@ func (r *DevelopmentEnvironmentReconciler) reconcileDelete(ctx context.Context, 
 				// The claim disappeared concurrently, so there is nothing left to retain.
 			} else if err != nil {
 				return ctrl.Result{}, err
+			} else {
+				logger.Info("Removed controller ownership from retained workspace PVC", "pvc", existing.Name, "storageIdentity", naming.StorageIdentity(env))
 			}
+		} else if err == nil {
+			logger.V(2).Info("Retained workspace PVC is already detached", "pvc", existing.Name, "storageIdentity", naming.StorageIdentity(env))
 		}
 	}
 	objects := []client.Object{resources.DesiredDeployment(env), resources.DesiredService(env), resources.DesiredIngress(env)}
@@ -335,16 +445,29 @@ func (r *DevelopmentEnvironmentReconciler) reconcileDelete(ctx context.Context, 
 	}
 	before := env.DeepCopy()
 	controllerutil.RemoveFinalizer(env, finalizer)
+	logger.Info("Removing DevelopmentEnvironment finalizer")
 	return ctrl.Result{}, r.patchParent(ctx, env, before, "remove finalizer")
 }
 func (r *DevelopmentEnvironmentReconciler) deleteAndConfirm(ctx context.Context, object client.Object) (bool, error) {
-	if err := r.Delete(ctx, object); apierrors.IsNotFound(err) {
+	key := client.ObjectKeyFromObject(object)
+	if err := r.Get(ctx, key, object); apierrors.IsNotFound(err) {
 		return true, nil
 	} else if err != nil {
-		return false, fmt.Errorf("delete %T: %w", object, err)
+		return false, fmt.Errorf("get %T before deletion: %w", object, err)
 	}
-	err := r.Get(ctx, client.ObjectKeyFromObject(object), object)
+	if object.GetDeletionTimestamp().IsZero() {
+		if pvc, ok := object.(*corev1.PersistentVolumeClaim); ok {
+			ctrl.LoggerFrom(ctx).Info("Deleting workspace PVC", "pvc", pvc.Name, "storageIdentity", pvc.Annotations[naming.StorageIdentityAnnotation])
+		}
+		if err := r.Delete(ctx, object); apierrors.IsNotFound(err) {
+			return true, nil
+		} else if err != nil {
+			return false, fmt.Errorf("delete %T: %w", object, err)
+		}
+	}
+	err := r.Get(ctx, key, object)
 	if apierrors.IsNotFound(err) {
+		ctrl.LoggerFrom(ctx).Info("Deleted managed child resource", "kind", childKind(object), "name", object.GetName())
 		return true, nil
 	}
 	if err != nil {

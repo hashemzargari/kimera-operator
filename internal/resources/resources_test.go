@@ -6,12 +6,13 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
 
 	platformv1alpha1 "github.com/hashemzargari/kimera-operator/api/v1alpha1"
 )
 
 func testEnvironment() *platformv1alpha1.DevelopmentEnvironment {
-	return &platformv1alpha1.DevelopmentEnvironment{ObjectMeta: metav1.ObjectMeta{Name: "demo", Namespace: "default"}, Spec: platformv1alpha1.DevelopmentEnvironmentSpec{Image: "codercom/code-server:latest", Resources: platformv1alpha1.ResourceSpec{CPURequest: resource.MustParse("250m"), CPULimit: resource.MustParse("1"), MemoryRequest: resource.MustParse("512Mi"), MemoryLimit: resource.MustParse("1Gi")}, Storage: platformv1alpha1.StorageSpec{Size: resource.MustParse("2Gi")}, Network: platformv1alpha1.NetworkSpec{Enabled: true, Host: "demo.kimera.local"}}}
+	return &platformv1alpha1.DevelopmentEnvironment{ObjectMeta: metav1.ObjectMeta{Name: "demo", Namespace: "default", UID: types.UID("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa")}, Spec: platformv1alpha1.DevelopmentEnvironmentSpec{Image: "codercom/code-server:latest", Resources: platformv1alpha1.ResourceSpec{CPURequest: resource.MustParse("250m"), CPULimit: resource.MustParse("1"), MemoryRequest: resource.MustParse("512Mi"), MemoryLimit: resource.MustParse("1Gi")}, Storage: platformv1alpha1.StorageSpec{Size: resource.MustParse("2Gi")}, Network: platformv1alpha1.NetworkSpec{Enabled: true, Host: "demo.kimera.local"}}}
 }
 
 func TestDesiredDeploymentConfiguresCodeServerSafely(t *testing.T) {
@@ -44,12 +45,16 @@ func TestDesiredServiceAndIngressUseStableHTTPRouting(t *testing.T) {
 }
 
 func TestDesiredPVCOmitsStorageClassWhenNotSpecified(t *testing.T) {
-	pvc := DesiredPVC(testEnvironment())
+	env := testEnvironment()
+	pvc := DesiredPVC(env)
 	if pvc.Spec.StorageClassName != nil {
 		t.Fatal("expected unspecified StorageClass to use the cluster default")
 	}
 	storage := pvc.Spec.Resources.Requests[corev1.ResourceStorage]
 	if storage.Cmp(resource.MustParse("2Gi")) != 0 {
 		t.Fatal("unexpected PVC storage request")
+	}
+	if pvc.Labels["platform.kimera.dev/environment-uid"] != string(env.UID) || pvc.Annotations["platform.kimera.dev/storage-identity"] != string(env.UID) {
+		t.Fatal("PVC is missing immutable environment provenance")
 	}
 }

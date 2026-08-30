@@ -14,11 +14,14 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
 	platformv1alpha1 "github.com/hashemzargari/kimera-operator/api/v1alpha1"
+	"github.com/hashemzargari/kimera-operator/internal/naming"
+	"github.com/hashemzargari/kimera-operator/internal/resources"
 )
 
 func TestReconcileMissingParentIsTerminal(t *testing.T) {
@@ -261,7 +264,7 @@ func TestRetentionPoliciesDuringDeletion(t *testing.T) {
 				t.Fatal(err)
 			}
 			pvc := &corev1.PersistentVolumeClaim{}
-			err := base.Get(context.Background(), client.ObjectKey{Name: env.Name + "-workspace", Namespace: "default"}, pvc)
+			err := base.Get(context.Background(), client.ObjectKey{Name: naming.PVC(env), Namespace: "default"}, pvc)
 			if test.pvcRemains && err != nil {
 				t.Fatalf("retained PVC missing: %v", err)
 			}
@@ -276,6 +279,140 @@ func TestRetentionPoliciesDuringDeletion(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestSameEnvironmentIdentityUsesOneStablePVC(t *testing.T) {
+	reconciler, base := unitReconciler(t)
+	env := unitEnvironment("stable-storage")
+	if err := base.Create(context.Background(), env); err != nil {
+		t.Fatal(err)
+	}
+	for range 4 {
+		if _, err := reconciler.Reconcile(context.Background(), request(env.Name)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	claims := &corev1.PersistentVolumeClaimList{}
+	if err := base.List(context.Background(), claims, client.InNamespace(env.Namespace)); err != nil {
+		t.Fatal(err)
+	}
+	if len(claims.Items) != 1 {
+		t.Fatalf("PVC count = %d, want 1", len(claims.Items))
+	}
+	if claims.Items[0].Name != naming.PVC(env) {
+		t.Fatalf("PVC = %q, want %q", claims.Items[0].Name, naming.PVC(env))
+	}
+}
+
+func TestRecreatedSameNameEnvironmentDoesNotAdoptRetainedPVC(t *testing.T) {
+	reconciler, base := unitReconciler(t)
+	first := unitEnvironment("demo")
+	first.UID = types.UID("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa")
+	if err := base.Create(context.Background(), first); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := reconciler.Reconcile(context.Background(), request(first.Name)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := reconciler.Reconcile(context.Background(), request(first.Name)); err != nil {
+		t.Fatal(err)
+	}
+	firstPVC := naming.PVC(first)
+	if err := base.Delete(context.Background(), first); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := reconciler.Reconcile(context.Background(), request(first.Name)); err != nil {
+		t.Fatal(err)
+	}
+	if err := base.Get(context.Background(), client.ObjectKey{Name: firstPVC, Namespace: first.Namespace}, &corev1.PersistentVolumeClaim{}); err != nil {
+		t.Fatalf("retained PVC A missing: %v", err)
+	}
+
+	second := unitEnvironment("demo")
+	second.UID = types.UID("bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb")
+	if err := base.Create(context.Background(), second); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := reconciler.Reconcile(context.Background(), request(second.Name)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := reconciler.Reconcile(context.Background(), request(second.Name)); err != nil {
+		t.Fatal(err)
+	}
+	secondPVC := naming.PVC(second)
+	if firstPVC == secondPVC {
+		t.Fatalf("different CR UIDs resolved to the same PVC %q", firstPVC)
+	}
+	if err := base.Get(context.Background(), client.ObjectKey{Name: secondPVC, Namespace: second.Namespace}, &corev1.PersistentVolumeClaim{}); err != nil {
+		t.Fatalf("PVC B missing: %v", err)
+	}
+	deployment := &appsv1.Deployment{}
+	if err := base.Get(context.Background(), client.ObjectKeyFromObject(second), deployment); err != nil {
+		t.Fatal(err)
+	}
+	if got := deployment.Spec.Template.Spec.Volumes[0].PersistentVolumeClaim.ClaimName; got != secondPVC {
+		t.Fatalf("new environment mounted %q, want %q", got, secondPVC)
+	}
+}
+
+func TestPVCWithCollidingGeneratedNameButWrongProvenanceIsRejected(t *testing.T) {
+	reconciler, base := unitReconciler(t)
+	env := unitEnvironment("provenance-collision")
+	env.Finalizers = []string{finalizer}
+	if err := base.Create(context.Background(), env); err != nil {
+		t.Fatal(err)
+	}
+	orphan := resources.DesiredPVC(env)
+	orphan.Labels = map[string]string{}
+	orphan.Annotations = map[string]string{}
+	if err := base.Create(context.Background(), orphan); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := reconciler.Reconcile(context.Background(), request(env.Name)); err != nil {
+		t.Fatal(err)
+	}
+	assertPhase(t, base, env.Name, platformv1alpha1.PhaseFailed)
+	if err := base.Get(context.Background(), client.ObjectKeyFromObject(env), &appsv1.Deployment{}); !apierrors.IsNotFound(err) {
+		t.Fatalf("Deployment created despite unsafe PVC collision: %v", err)
+	}
+}
+
+func TestCurrentIdentityPVCWithIncompatibleStorageClassIsRejected(t *testing.T) {
+	reconciler, base := unitReconciler(t)
+	env := unitEnvironment("incompatible-pvc")
+	env.Finalizers = []string{finalizer}
+	env.Spec.Storage.StorageClassName = "requested-class"
+	if err := base.Create(context.Background(), env); err != nil {
+		t.Fatal(err)
+	}
+	claim := resources.DesiredPVC(env)
+	actualClass := "other-class"
+	claim.Spec.StorageClassName = &actualClass
+	if err := base.Create(context.Background(), claim); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := reconciler.Reconcile(context.Background(), request(env.Name)); err != nil {
+		t.Fatal(err)
+	}
+	assertPhase(t, base, env.Name, platformv1alpha1.PhaseFailed)
+}
+
+func TestCurrentIdentityPVCWithIncompatibleAccessModeIsRejected(t *testing.T) {
+	reconciler, base := unitReconciler(t)
+	env := unitEnvironment("incompatible-access-mode")
+	env.Finalizers = []string{finalizer}
+	if err := base.Create(context.Background(), env); err != nil {
+		t.Fatal(err)
+	}
+	claim := resources.DesiredPVC(env)
+	claim.Spec.AccessModes = []corev1.PersistentVolumeAccessMode{corev1.ReadWriteMany}
+	if err := base.Create(context.Background(), claim); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := reconciler.Reconcile(context.Background(), request(env.Name)); err != nil {
+		t.Fatal(err)
+	}
+	assertPhase(t, base, env.Name, platformv1alpha1.PhaseFailed)
 }
 
 func TestServiceAssignedFieldsAndDeploymentSelectorArePreserved(t *testing.T) {
@@ -417,7 +554,7 @@ func unitReconciler(t *testing.T) (*DevelopmentEnvironmentReconciler, client.Cli
 }
 
 func unitEnvironment(name string) *platformv1alpha1.DevelopmentEnvironment {
-	return &platformv1alpha1.DevelopmentEnvironment{ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: "default"}, Spec: platformv1alpha1.DevelopmentEnvironmentSpec{Image: "codercom/code-server:latest", Resources: platformv1alpha1.ResourceSpec{CPURequest: resource.MustParse("250m"), CPULimit: resource.MustParse("1"), MemoryRequest: resource.MustParse("512Mi"), MemoryLimit: resource.MustParse("1Gi")}, Storage: platformv1alpha1.StorageSpec{Size: resource.MustParse("2Gi"), RetentionPolicy: "Retain"}}}
+	return &platformv1alpha1.DevelopmentEnvironment{ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: "default", UID: types.UID("uid-" + name)}, Spec: platformv1alpha1.DevelopmentEnvironmentSpec{Image: "codercom/code-server:latest", Resources: platformv1alpha1.ResourceSpec{CPURequest: resource.MustParse("250m"), CPULimit: resource.MustParse("1"), MemoryRequest: resource.MustParse("512Mi"), MemoryLimit: resource.MustParse("1Gi")}, Storage: platformv1alpha1.StorageSpec{Size: resource.MustParse("2Gi"), RetentionPolicy: "Retain"}}}
 }
 
 func request(name string) ctrl.Request {
@@ -429,7 +566,11 @@ func markChildrenReady(t *testing.T, base client.Client, name string) {
 	ctx := context.Background()
 	key := client.ObjectKey{Name: name, Namespace: "default"}
 	pvc := &corev1.PersistentVolumeClaim{}
-	if err := base.Get(ctx, client.ObjectKey{Name: name + "-workspace", Namespace: "default"}, pvc); err != nil {
+	env := &platformv1alpha1.DevelopmentEnvironment{}
+	if err := base.Get(ctx, key, env); err != nil {
+		t.Fatal(err)
+	}
+	if err := base.Get(ctx, client.ObjectKey{Name: naming.PVC(env), Namespace: "default"}, pvc); err != nil {
 		t.Fatal(err)
 	}
 	pvc.Status.Phase = corev1.ClaimBound

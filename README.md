@@ -41,8 +41,26 @@ kubectl get developmentenvironment demo -o yaml
    `http://demo.kimera.local`.
 4. Delete `kubectl delete deployment demo`; the owned-resource watch makes the operator recreate it.
 5. Edit the sample CR's CPU request or image and apply it again; observe the Deployment roll out.
-6. Delete the CR with `retentionPolicy: Retain` and verify `demo-workspace` remains.
+6. Delete the CR with `retentionPolicy: Retain` and verify its UID-derived workspace PVC remains.
 7. Reapply it with `retentionPolicy: Delete`, then delete the CR and verify the PVC is removed.
 
 Storage expansion is passed to Kubernetes only when requested size increases. PVC
 shrinking is never attempted and is reported in the resource status as a failure.
+
+## Workspace identity and retention
+
+Workspace PVC names include the immutable `DevelopmentEnvironment` UID. Reconciliation of the
+same CR instance therefore uses one stable claim, while deleting and recreating a CR with the
+same name produces a different claim. `Retain` preserves the old claim and its provenance; it
+does not authorize a future same-name CR to mount that data.
+
+Inspect retained storage with:
+
+```sh
+kubectl get pvc -l platform.kimera.dev/managed-by=kimera --show-labels
+```
+
+Explicit restoration is future control-plane work. A restore flow must intentionally reference
+the retained storage identity and verify KIMERA provenance, compatibility, attachment state, and
+the authenticated caller's authorization. Phase 1 does not infer business ownership from a
+Kubernetes resource name and never adopts retained storage implicitly.
