@@ -21,11 +21,14 @@ import (
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
+	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
+	networkingv1 "k8s.io/api/networking/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/resource"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/types"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -34,11 +37,13 @@ import (
 	"github.com/hashemzargari/kimera-operator/internal/naming"
 )
 
+const networkEnabledFieldKey = "enabled"
+
 var _ = Describe("DevelopmentEnvironment Controller", func() {
 	Context("When reconciling a resource", func() {
 		const (
 			resourceName      = "test-resource"
-			resourceNamespace = "default"
+			resourceNamespace = unitNamespace
 		)
 
 		ctx := context.Background()
@@ -61,7 +66,8 @@ var _ = Describe("DevelopmentEnvironment Controller", func() {
 					Spec: platformv1alpha1.DevelopmentEnvironmentSpec{
 						Image:     "example.invalid/code-server:v1",
 						Resources: platformv1alpha1.ResourceSpec{CPURequest: resource.MustParse("100m"), CPULimit: resource.MustParse("1"), MemoryRequest: resource.MustParse("128Mi"), MemoryLimit: resource.MustParse("512Mi")},
-						Storage:   platformv1alpha1.StorageSpec{Size: resource.MustParse("1Gi"), RetentionPolicy: "Retain"},
+						Storage:   platformv1alpha1.StorageSpec{Size: resource.MustParse("1Gi"), RetentionPolicy: unitRetainPolicy},
+						Network:   platformv1alpha1.NetworkSpec{Enabled: true, Host: "test-resource.example.com"},
 					},
 				}
 				Expect(k8sClient.Create(ctx, environment)).To(Succeed())
@@ -95,6 +101,15 @@ var _ = Describe("DevelopmentEnvironment Controller", func() {
 			Expect(k8sClient.Get(ctx, typeNamespacedName, current)).To(Succeed())
 			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: naming.PVC(current), Namespace: resourceNamespace}, &corev1.PersistentVolumeClaim{})).To(Succeed())
 			Expect(k8sClient.Get(ctx, typeNamespacedName, &corev1.Service{})).To(Succeed())
+			Expect(k8sClient.Get(ctx, typeNamespacedName, &networkingv1.Ingress{})).To(Succeed())
+
+			recorder := &stablePatchCountingClient{Client: k8sClient}
+			controllerReconciler.Client = recorder
+			_, err = controllerReconciler.Reconcile(ctx, reconcile.Request{NamespacedName: typeNamespacedName})
+			Expect(err).NotTo(HaveOccurred())
+			Expect(recorder.deploymentPatches).To(Equal(0))
+			Expect(recorder.servicePatches).To(Equal(0))
+			Expect(recorder.ingressPatches).To(Equal(0))
 		})
 	})
 })
@@ -108,10 +123,10 @@ var _ = Describe("DevelopmentEnvironment API validation", func() {
 		}{
 			{name: "network-omitted", valid: true},
 			{name: "empty-network", network: map[string]any{}, valid: true},
-			{name: "network-disabled", network: map[string]any{"enabled": false}, valid: true},
-			{name: "enabled-without-host", network: map[string]any{"enabled": true}, valid: false},
-			{name: "enabled-with-empty-host", network: map[string]any{"enabled": true, "host": ""}, valid: false},
-			{name: "enabled-with-host", network: map[string]any{"enabled": true, "host": "demo.kimera.local"}, valid: true},
+			{name: "network-disabled", network: map[string]any{networkEnabledFieldKey: false}, valid: true},
+			{name: "enabled-without-host", network: map[string]any{networkEnabledFieldKey: true}, valid: false},
+			{name: "enabled-with-empty-host", network: map[string]any{networkEnabledFieldKey: true, "host": ""}, valid: false},
+			{name: "enabled-with-host", network: map[string]any{networkEnabledFieldKey: true, "host": "demo.kimera.local"}, valid: true},
 		}
 
 		for _, test := range tests {
@@ -139,7 +154,26 @@ func validationObject(name string, network map[string]any) *unstructured.Unstruc
 	return &unstructured.Unstructured{Object: map[string]any{
 		"apiVersion": "platform.kimera.dev/v1alpha1",
 		"kind":       "DevelopmentEnvironment",
-		"metadata":   map[string]any{"name": name, "namespace": "default"},
+		"metadata":   map[string]any{"name": name, "namespace": unitNamespace},
 		"spec":       spec,
 	}}
+}
+
+type stablePatchCountingClient struct {
+	client.Client
+	deploymentPatches int
+	servicePatches    int
+	ingressPatches    int
+}
+
+func (c *stablePatchCountingClient) Patch(ctx context.Context, object client.Object, patch client.Patch, options ...client.PatchOption) error {
+	switch object.(type) {
+	case *appsv1.Deployment:
+		c.deploymentPatches++
+	case *corev1.Service:
+		c.servicePatches++
+	case *networkingv1.Ingress:
+		c.ingressPatches++
+	}
+	return c.Client.Patch(ctx, object, patch, options...)
 }

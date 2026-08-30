@@ -44,8 +44,15 @@ kubectl get developmentenvironment demo -o yaml
 6. Delete the CR with `retentionPolicy: Retain` and verify its UID-derived workspace PVC remains.
 7. Reapply it with `retentionPolicy: Delete`, then delete the CR and verify the PVC is removed.
 
-Storage expansion is passed to Kubernetes only when requested size increases. PVC
-shrinking is never attempted and is reported in the resource status as a failure.
+Storage expansion is passed to Kubernetes only for a Bound PVC whose actual StorageClass
+explicitly enables expansion. Unsupported expansion is reported as `Degraded` with
+`StorageReady=False`; shrinking and changing an existing PVC's StorageClass are reported as
+terminal `Failed` states without repeatedly sending an API write that Kubernetes will reject.
+Restoring the requested size to the PVC's current size lets reconciliation return to `Ready`.
+
+The controller reads StorageClasses directly for expansion capability checks but does not watch
+them cluster-wide. If an administrator later enables expansion, update the
+DevelopmentEnvironment spec to trigger re-evaluation.
 
 ## Workspace identity and retention
 

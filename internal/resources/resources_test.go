@@ -39,7 +39,7 @@ func TestDesiredServiceAndIngressUseStableHTTPRouting(t *testing.T) {
 	if service.Spec.Type != corev1.ServiceTypeClusterIP || service.Spec.Ports[0].Port != 80 {
 		t.Fatal("expected ClusterIP service on port 80")
 	}
-	if ingress.Spec.Rules[0].Host != env.Spec.Network.Host || ingress.Spec.Rules[0].IngressRuleValue.HTTP.Paths[0].Backend.Service.Name != service.Name {
+	if ingress.Spec.Rules[0].Host != env.Spec.Network.Host || ingress.Spec.Rules[0].HTTP.Paths[0].Backend.Service.Name != service.Name {
 		t.Fatal("expected ingress to route to the generated service")
 	}
 }

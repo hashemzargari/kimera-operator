@@ -8,8 +8,10 @@ import (
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	networkingv1 "k8s.io/api/networking/v1"
+	storagev1 "k8s.io/api/storage/v1"
 	"k8s.io/apimachinery/pkg/api/equality"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/meta"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -22,12 +24,19 @@ import (
 	platformv1alpha1 "github.com/hashemzargari/kimera-operator/api/v1alpha1"
 	"github.com/hashemzargari/kimera-operator/internal/naming"
 	"github.com/hashemzargari/kimera-operator/internal/resources"
+	statusutil "github.com/hashemzargari/kimera-operator/internal/status"
+)
+
+const (
+	unitNamespace     = "default"
+	unitRetainPolicy  = "Retain"
+	assignedClusterIP = "10.0.0.42"
 )
 
 func TestReconcileMissingParentIsTerminal(t *testing.T) {
 	reconciler, _ := unitReconciler(t)
 	result, err := reconciler.Reconcile(context.Background(), request("does-not-exist"))
-	if err != nil || result.Requeue {
+	if err != nil || result.RequeueAfter > 0 {
 		t.Fatalf("missing parent should be terminal: result=%+v err=%v", result, err)
 	}
 }
@@ -115,14 +124,15 @@ func TestDeletionIgnoresAlreadyDeletedChildren(t *testing.T) {
 		t.Fatal(err)
 	}
 	result, err := reconciler.reconcileDelete(context.Background(), env)
-	if err != nil || result.Requeue {
+	if err != nil || result.RequeueAfter > 0 {
 		t.Fatalf("cleanup with absent children should succeed: result=%+v err=%v", result, err)
 	}
 }
 
-func TestNoOpReconcileDoesNotPatchDeployment(t *testing.T) {
+func TestNoOpReconcileDoesNotPatchManagedChildren(t *testing.T) {
 	reconciler, base := unitReconciler(t)
 	env := unitEnvironment("no-op")
+	env.Spec.Network = platformv1alpha1.NetworkSpec{Enabled: true, Host: "no-op.example.com"}
 	if err := base.Create(context.Background(), env); err != nil {
 		t.Fatal(err)
 	}
@@ -132,13 +142,88 @@ func TestNoOpReconcileDoesNotPatchDeployment(t *testing.T) {
 	if _, err := reconciler.Reconcile(context.Background(), request(env.Name)); err != nil {
 		t.Fatal(err)
 	}
-	tracker := &deploymentPatchCountingClient{Client: base}
+	tracker := &childPatchCountingClient{Client: base}
 	reconciler.Client = tracker
 	if _, err := reconciler.Reconcile(context.Background(), request(env.Name)); err != nil {
 		t.Fatal(err)
 	}
-	if tracker.deploymentPatches != 0 {
-		t.Fatalf("no-op reconciliation patched Deployment %d times", tracker.deploymentPatches)
+	if tracker.deploymentPatches != 0 || tracker.servicePatches != 0 || tracker.ingressPatches != 0 || tracker.pvcPatches != 0 {
+		t.Fatalf("no-op reconciliation patched children: Deployment=%d Service=%d Ingress=%d PVC=%d", tracker.deploymentPatches, tracker.servicePatches, tracker.ingressPatches, tracker.pvcPatches)
+	}
+}
+
+func TestOwnedChildDriftIsCorrectedOnceThenConverges(t *testing.T) {
+	reconciler, base := unitReconciler(t)
+	env := unitEnvironment("drift")
+	env.Spec.Network = platformv1alpha1.NetworkSpec{Enabled: true, Host: "drift.example.com"}
+	if err := base.Create(context.Background(), env); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := reconciler.Reconcile(context.Background(), request(env.Name)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := reconciler.Reconcile(context.Background(), request(env.Name)); err != nil {
+		t.Fatal(err)
+	}
+	key := client.ObjectKeyFromObject(env)
+	deployment := &appsv1.Deployment{}
+	if err := base.Get(context.Background(), key, deployment); err != nil {
+		t.Fatal(err)
+	}
+	zero := int32(0)
+	deployment.Spec.Replicas = &zero
+	if err := base.Update(context.Background(), deployment); err != nil {
+		t.Fatal(err)
+	}
+	service := &corev1.Service{}
+	if err := base.Get(context.Background(), key, service); err != nil {
+		t.Fatal(err)
+	}
+	service.Spec.Ports[0].Port = 81
+	if err := base.Update(context.Background(), service); err != nil {
+		t.Fatal(err)
+	}
+	ingress := &networkingv1.Ingress{}
+	if err := base.Get(context.Background(), key, ingress); err != nil {
+		t.Fatal(err)
+	}
+	ingress.Spec.Rules[0].Host = "drifted.example.com"
+	if err := base.Update(context.Background(), ingress); err != nil {
+		t.Fatal(err)
+	}
+
+	tracker := &childPatchCountingClient{Client: base}
+	reconciler.Client = tracker
+	if _, err := reconciler.Reconcile(context.Background(), request(env.Name)); err != nil {
+		t.Fatal(err)
+	}
+	if tracker.deploymentPatches != 1 || tracker.servicePatches != 1 || tracker.ingressPatches != 1 {
+		t.Fatalf("corrective patches: Deployment=%d Service=%d Ingress=%d, want one each", tracker.deploymentPatches, tracker.servicePatches, tracker.ingressPatches)
+	}
+	if err := base.Get(context.Background(), key, deployment); err != nil {
+		t.Fatal(err)
+	}
+	if deployment.Spec.Replicas == nil || *deployment.Spec.Replicas != 1 {
+		t.Fatalf("replicas = %v, want 1", deployment.Spec.Replicas)
+	}
+	if err := base.Get(context.Background(), key, service); err != nil {
+		t.Fatal(err)
+	}
+	if service.Spec.Ports[0].Port != 80 {
+		t.Fatalf("Service port = %d, want 80", service.Spec.Ports[0].Port)
+	}
+	if err := base.Get(context.Background(), key, ingress); err != nil {
+		t.Fatal(err)
+	}
+	if ingress.Spec.Rules[0].Host != env.Spec.Network.Host {
+		t.Fatalf("Ingress host = %q, want %q", ingress.Spec.Rules[0].Host, env.Spec.Network.Host)
+	}
+	tracker.deploymentPatches, tracker.servicePatches, tracker.ingressPatches = 0, 0, 0
+	if _, err := reconciler.Reconcile(context.Background(), request(env.Name)); err != nil {
+		t.Fatal(err)
+	}
+	if tracker.deploymentPatches != 0 || tracker.servicePatches != 0 || tracker.ingressPatches != 0 {
+		t.Fatalf("post-correction reconcile patched children: Deployment=%d Service=%d Ingress=%d", tracker.deploymentPatches, tracker.servicePatches, tracker.ingressPatches)
 	}
 }
 
@@ -243,7 +328,7 @@ func TestRetentionPoliciesDuringDeletion(t *testing.T) {
 	for _, test := range []struct {
 		name, policy string
 		pvcRemains   bool
-	}{{"retain-delete", "Retain", true}, {"delete-delete", "Delete", false}} {
+	}{{"retain-delete", unitRetainPolicy, true}, {"delete-delete", "Delete", false}} {
 		t.Run(test.policy, func(t *testing.T) {
 			reconciler, base := unitReconciler(t)
 			env := unitEnvironment(test.name)
@@ -264,7 +349,7 @@ func TestRetentionPoliciesDuringDeletion(t *testing.T) {
 				t.Fatal(err)
 			}
 			pvc := &corev1.PersistentVolumeClaim{}
-			err := base.Get(context.Background(), client.ObjectKey{Name: naming.PVC(env), Namespace: "default"}, pvc)
+			err := base.Get(context.Background(), client.ObjectKey{Name: naming.PVC(env), Namespace: unitNamespace}, pvc)
 			if test.pvcRemains && err != nil {
 				t.Fatalf("retained PVC missing: %v", err)
 			}
@@ -274,7 +359,7 @@ func TestRetentionPoliciesDuringDeletion(t *testing.T) {
 			if test.pvcRemains && metav1.IsControlledBy(pvc, env) {
 				t.Fatal("retained PVC still has parent controller reference")
 			}
-			if result, err := reconciler.Reconcile(context.Background(), request(env.Name)); err != nil || result.Requeue {
+			if result, err := reconciler.Reconcile(context.Background(), request(env.Name)); err != nil || result.RequeueAfter > 0 {
 				t.Fatalf("stale post-deletion event was not terminal: result=%+v err=%v", result, err)
 			}
 		})
@@ -415,6 +500,125 @@ func TestCurrentIdentityPVCWithIncompatibleAccessModeIsRejected(t *testing.T) {
 	assertPhase(t, base, env.Name, platformv1alpha1.PhaseFailed)
 }
 
+func TestSupportedPVCExpansionPatchesOnce(t *testing.T) {
+	reconciler, base, env := readyEnvironmentWithStorageClass(t, "supported-expansion", true)
+	updateStorageSize(t, base, env.Name, "3Gi")
+	tracker := &childPatchCountingClient{Client: base}
+	reconciler.Client = tracker
+	if _, err := reconciler.Reconcile(context.Background(), request(env.Name)); err != nil {
+		t.Fatal(err)
+	}
+	if tracker.pvcPatches != 1 {
+		t.Fatalf("PVC patches = %d, want 1", tracker.pvcPatches)
+	}
+	pvc := getPVC(t, base, env.Name)
+	requested := pvc.Spec.Resources.Requests[corev1.ResourceStorage]
+	if requested.Cmp(resource.MustParse("3Gi")) != 0 {
+		t.Fatalf("PVC request = %s, want 3Gi", requested.String())
+	}
+}
+
+func TestUnsupportedPVCExpansionIsTerminalAndRecoversAfterSpecRestore(t *testing.T) {
+	reconciler, base, env := readyEnvironmentWithStorageClass(t, "unsupported-expansion", false)
+	updateStorageSize(t, base, env.Name, "3Gi")
+	tracker := &childPatchCountingClient{Client: base}
+	reconciler.Client = tracker
+	if result, err := reconciler.Reconcile(context.Background(), request(env.Name)); err != nil || result.RequeueAfter > 0 {
+		t.Fatalf("unsupported expansion should be terminal: result=%+v err=%v", result, err)
+	}
+	if tracker.pvcPatches != 0 {
+		t.Fatalf("unsupported expansion patched PVC %d times", tracker.pvcPatches)
+	}
+	if tracker.statusPatches != 1 {
+		t.Fatalf("initial unsupported expansion status patches = %d, want 1", tracker.statusPatches)
+	}
+	assertPhase(t, base, env.Name, platformv1alpha1.PhaseDegraded)
+	assertCondition(t, base, env.Name, statusutil.StorageReady, metav1.ConditionFalse, "VolumeExpansionUnsupported")
+	assertCondition(t, base, env.Name, statusutil.Ready, metav1.ConditionFalse, "VolumeExpansionUnsupported")
+	assertCondition(t, base, env.Name, statusutil.Progressing, metav1.ConditionFalse, "VolumeExpansionUnsupported")
+	current := &platformv1alpha1.DevelopmentEnvironment{}
+	if err := base.Get(context.Background(), client.ObjectKeyFromObject(env), current); err != nil {
+		t.Fatal(err)
+	}
+	if current.Status.ObservedGeneration != current.Generation {
+		t.Fatalf("observedGeneration = %d, generation = %d", current.Status.ObservedGeneration, current.Generation)
+	}
+	if result, err := reconciler.Reconcile(context.Background(), request(env.Name)); err != nil || result.RequeueAfter > 0 {
+		t.Fatalf("repeated unsupported expansion should remain terminal: result=%+v err=%v", result, err)
+	}
+	if tracker.pvcPatches != 0 {
+		t.Fatalf("repeated unsupported expansion patched PVC %d times", tracker.pvcPatches)
+	}
+	if tracker.statusPatches != 1 {
+		t.Fatalf("repeated unsupported expansion wrote status again: patches=%d", tracker.statusPatches)
+	}
+
+	updateStorageSize(t, base, env.Name, "2Gi")
+	if _, err := reconciler.Reconcile(context.Background(), request(env.Name)); err != nil {
+		t.Fatal(err)
+	}
+	assertPhase(t, base, env.Name, platformv1alpha1.PhaseReady)
+	assertCondition(t, base, env.Name, statusutil.StorageReady, metav1.ConditionTrue, "PVCObserved")
+}
+
+func TestPVCShrinkIsTerminalWithoutPatch(t *testing.T) {
+	reconciler, base, env := readyEnvironmentWithStorageClass(t, "shrink", true)
+	pvc := getPVC(t, base, env.Name)
+	pvc.Spec.Resources.Requests[corev1.ResourceStorage] = resource.MustParse("3Gi")
+	if err := base.Update(context.Background(), pvc); err != nil {
+		t.Fatal(err)
+	}
+	tracker := &childPatchCountingClient{Client: base}
+	reconciler.Client = tracker
+	if result, err := reconciler.Reconcile(context.Background(), request(env.Name)); err != nil || result.RequeueAfter > 0 {
+		t.Fatalf("shrink should be terminal: result=%+v err=%v", result, err)
+	}
+	if tracker.pvcPatches != 0 {
+		t.Fatalf("shrink attempted %d PVC patches", tracker.pvcPatches)
+	}
+	assertPhase(t, base, env.Name, platformv1alpha1.PhaseFailed)
+	assertCondition(t, base, env.Name, statusutil.StorageReady, metav1.ConditionFalse, "VolumeShrinkUnsupported")
+}
+
+func TestPVCStorageClassChangeIsTerminalWithoutPatch(t *testing.T) {
+	reconciler, base, env := readyEnvironmentWithStorageClass(t, "storage-class-change", true)
+	current := &platformv1alpha1.DevelopmentEnvironment{}
+	if err := base.Get(context.Background(), client.ObjectKeyFromObject(env), current); err != nil {
+		t.Fatal(err)
+	}
+	current.Spec.Storage.StorageClassName = "another-class"
+	current.Generation++
+	if err := base.Update(context.Background(), current); err != nil {
+		t.Fatal(err)
+	}
+	tracker := &childPatchCountingClient{Client: base}
+	reconciler.Client = tracker
+	if result, err := reconciler.Reconcile(context.Background(), request(env.Name)); err != nil || result.RequeueAfter > 0 {
+		t.Fatalf("StorageClass change should be terminal: result=%+v err=%v", result, err)
+	}
+	if tracker.pvcPatches != 0 {
+		t.Fatalf("StorageClass change attempted %d PVC patches", tracker.pvcPatches)
+	}
+	assertPhase(t, base, env.Name, platformv1alpha1.PhaseFailed)
+	assertCondition(t, base, env.Name, statusutil.StorageReady, metav1.ConditionFalse, "StorageClassImmutable")
+}
+
+func TestPVCExpansionConflictIsReturnedForRetry(t *testing.T) {
+	reconciler, base, env := readyEnvironmentWithStorageClass(t, "expansion-conflict", true)
+	updateStorageSize(t, base, env.Name, "3Gi")
+	reconciler.Client = &conflictOnceClient{Client: base, conflictPVCPatch: true}
+	if _, err := reconciler.Reconcile(context.Background(), request(env.Name)); !apierrors.IsConflict(err) {
+		t.Fatalf("expected retryable PVC conflict, got %v", err)
+	}
+	current := &platformv1alpha1.DevelopmentEnvironment{}
+	if err := base.Get(context.Background(), client.ObjectKeyFromObject(env), current); err != nil {
+		t.Fatal(err)
+	}
+	if current.Status.ObservedGeneration == current.Generation {
+		t.Fatal("transient PVC conflict was incorrectly recorded as an observed terminal state")
+	}
+}
+
 func TestServiceAssignedFieldsAndDeploymentSelectorArePreserved(t *testing.T) {
 	reconciler, base := unitReconciler(t)
 	env := unitEnvironment("preserve-fields")
@@ -433,8 +637,8 @@ func TestServiceAssignedFieldsAndDeploymentSelectorArePreserved(t *testing.T) {
 		t.Fatal(err)
 	}
 	policy := corev1.IPFamilyPolicySingleStack
-	service.Spec.ClusterIP = "10.0.0.42"
-	service.Spec.ClusterIPs = []string{"10.0.0.42"}
+	service.Spec.ClusterIP = assignedClusterIP
+	service.Spec.ClusterIPs = []string{assignedClusterIP}
 	service.Spec.IPFamilies = []corev1.IPFamily{corev1.IPv4Protocol}
 	service.Spec.IPFamilyPolicy = &policy
 	if err := base.Update(context.Background(), service); err != nil {
@@ -451,7 +655,7 @@ func TestServiceAssignedFieldsAndDeploymentSelectorArePreserved(t *testing.T) {
 	if err := base.Get(context.Background(), key, service); err != nil {
 		t.Fatal(err)
 	}
-	if service.Spec.ClusterIP != "10.0.0.42" || len(service.Spec.ClusterIPs) != 1 || service.Spec.IPFamilyPolicy == nil || *service.Spec.IPFamilyPolicy != policy {
+	if service.Spec.ClusterIP != assignedClusterIP || len(service.Spec.ClusterIPs) != 1 || service.Spec.IPFamilyPolicy == nil || *service.Spec.IPFamilyPolicy != policy {
 		t.Fatal("Service API-assigned fields were overwritten")
 	}
 	if err := base.Get(context.Background(), key, deployment); err != nil {
@@ -465,6 +669,7 @@ func TestServiceAssignedFieldsAndDeploymentSelectorArePreserved(t *testing.T) {
 type conflictOnceClient struct {
 	client.Client
 	conflictDeploymentPatch bool
+	conflictPVCPatch        bool
 }
 
 func (c *conflictOnceClient) Patch(ctx context.Context, object client.Object, patch client.Patch, options ...client.PatchOption) error {
@@ -474,17 +679,38 @@ func (c *conflictOnceClient) Patch(ctx context.Context, object client.Object, pa
 			return apierrors.NewConflict(schema.GroupResource{Group: "apps", Resource: "deployments"}, object.GetName(), errors.New("simulated conflict"))
 		}
 	}
+	if c.conflictPVCPatch {
+		if _, ok := object.(*corev1.PersistentVolumeClaim); ok {
+			c.conflictPVCPatch = false
+			return apierrors.NewConflict(schema.GroupResource{Resource: "persistentvolumeclaims"}, object.GetName(), errors.New("simulated conflict"))
+		}
+	}
 	return c.Client.Patch(ctx, object, patch, options...)
 }
 
-type deploymentPatchCountingClient struct {
+type childPatchCountingClient struct {
 	client.Client
 	deploymentPatches int
+	servicePatches    int
+	ingressPatches    int
+	pvcPatches        int
+	statusPatches     int
 }
 
-func (c *deploymentPatchCountingClient) Patch(ctx context.Context, object client.Object, patch client.Patch, options ...client.PatchOption) error {
-	if _, ok := object.(*appsv1.Deployment); ok {
+func (c *childPatchCountingClient) Status() client.SubResourceWriter {
+	return &statusPatchCountingWriter{SubResourceWriter: c.Client.Status(), count: &c.statusPatches}
+}
+
+func (c *childPatchCountingClient) Patch(ctx context.Context, object client.Object, patch client.Patch, options ...client.PatchOption) error {
+	switch object.(type) {
+	case *appsv1.Deployment:
 		c.deploymentPatches++
+	case *corev1.Service:
+		c.servicePatches++
+	case *networkingv1.Ingress:
+		c.ingressPatches++
+	case *corev1.PersistentVolumeClaim:
+		c.pvcPatches++
 	}
 	return c.Client.Patch(ctx, object, patch, options...)
 }
@@ -549,31 +775,35 @@ func unitReconciler(t *testing.T) (*DevelopmentEnvironmentReconciler, client.Cli
 	if err := networkingv1.AddToScheme(scheme); err != nil {
 		t.Fatal(err)
 	}
+	if err := storagev1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
 	base := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(&platformv1alpha1.DevelopmentEnvironment{}, &appsv1.Deployment{}, &corev1.PersistentVolumeClaim{}).Build()
-	return &DevelopmentEnvironmentReconciler{Client: base, Scheme: scheme}, base
+	return &DevelopmentEnvironmentReconciler{Client: base, APIReader: base, Scheme: scheme}, base
 }
 
 func unitEnvironment(name string) *platformv1alpha1.DevelopmentEnvironment {
-	return &platformv1alpha1.DevelopmentEnvironment{ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: "default", UID: types.UID("uid-" + name)}, Spec: platformv1alpha1.DevelopmentEnvironmentSpec{Image: "codercom/code-server:latest", Resources: platformv1alpha1.ResourceSpec{CPURequest: resource.MustParse("250m"), CPULimit: resource.MustParse("1"), MemoryRequest: resource.MustParse("512Mi"), MemoryLimit: resource.MustParse("1Gi")}, Storage: platformv1alpha1.StorageSpec{Size: resource.MustParse("2Gi"), RetentionPolicy: "Retain"}}}
+	return &platformv1alpha1.DevelopmentEnvironment{ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: unitNamespace, UID: types.UID("uid-" + name), Generation: 1}, Spec: platformv1alpha1.DevelopmentEnvironmentSpec{Image: "codercom/code-server:latest", Resources: platformv1alpha1.ResourceSpec{CPURequest: resource.MustParse("250m"), CPULimit: resource.MustParse("1"), MemoryRequest: resource.MustParse("512Mi"), MemoryLimit: resource.MustParse("1Gi")}, Storage: platformv1alpha1.StorageSpec{Size: resource.MustParse("2Gi"), RetentionPolicy: unitRetainPolicy}}}
 }
 
 func request(name string) ctrl.Request {
-	return ctrl.Request{NamespacedName: client.ObjectKey{Name: name, Namespace: "default"}}
+	return ctrl.Request{NamespacedName: client.ObjectKey{Name: name, Namespace: unitNamespace}}
 }
 
 func markChildrenReady(t *testing.T, base client.Client, name string) {
 	t.Helper()
 	ctx := context.Background()
-	key := client.ObjectKey{Name: name, Namespace: "default"}
+	key := client.ObjectKey{Name: name, Namespace: unitNamespace}
 	pvc := &corev1.PersistentVolumeClaim{}
 	env := &platformv1alpha1.DevelopmentEnvironment{}
 	if err := base.Get(ctx, key, env); err != nil {
 		t.Fatal(err)
 	}
-	if err := base.Get(ctx, client.ObjectKey{Name: naming.PVC(env), Namespace: "default"}, pvc); err != nil {
+	if err := base.Get(ctx, client.ObjectKey{Name: naming.PVC(env), Namespace: unitNamespace}, pvc); err != nil {
 		t.Fatal(err)
 	}
 	pvc.Status.Phase = corev1.ClaimBound
+	pvc.Status.Capacity = corev1.ResourceList{corev1.ResourceStorage: pvc.Spec.Resources.Requests[corev1.ResourceStorage]}
 	if err := base.Status().Update(ctx, pvc); err != nil {
 		t.Fatal(err)
 	}
@@ -587,10 +817,75 @@ func markChildrenReady(t *testing.T, base client.Client, name string) {
 	}
 }
 
+func readyEnvironmentWithStorageClass(t *testing.T, name string, allowExpansion bool) (*DevelopmentEnvironmentReconciler, client.Client, *platformv1alpha1.DevelopmentEnvironment) {
+	t.Helper()
+	reconciler, base := unitReconciler(t)
+	storageClassName := name + "-class"
+	storageClass := &storagev1.StorageClass{ObjectMeta: metav1.ObjectMeta{Name: storageClassName}, Provisioner: "example.com/test", AllowVolumeExpansion: &allowExpansion}
+	if err := base.Create(context.Background(), storageClass); err != nil {
+		t.Fatal(err)
+	}
+	env := unitEnvironment(name)
+	env.Spec.Storage.StorageClassName = storageClassName
+	if err := base.Create(context.Background(), env); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := reconciler.Reconcile(context.Background(), request(env.Name)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := reconciler.Reconcile(context.Background(), request(env.Name)); err != nil {
+		t.Fatal(err)
+	}
+	markChildrenReady(t, base, env.Name)
+	if _, err := reconciler.Reconcile(context.Background(), request(env.Name)); err != nil {
+		t.Fatal(err)
+	}
+	assertPhase(t, base, env.Name, platformv1alpha1.PhaseReady)
+	return reconciler, base, env
+}
+
+func updateStorageSize(t *testing.T, base client.Client, name, size string) {
+	t.Helper()
+	env := &platformv1alpha1.DevelopmentEnvironment{}
+	if err := base.Get(context.Background(), client.ObjectKey{Name: name, Namespace: unitNamespace}, env); err != nil {
+		t.Fatal(err)
+	}
+	env.Spec.Storage.Size = resource.MustParse(size)
+	env.Generation++
+	if err := base.Update(context.Background(), env); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func getPVC(t *testing.T, base client.Client, environmentName string) *corev1.PersistentVolumeClaim {
+	t.Helper()
+	env := &platformv1alpha1.DevelopmentEnvironment{}
+	if err := base.Get(context.Background(), client.ObjectKey{Name: environmentName, Namespace: unitNamespace}, env); err != nil {
+		t.Fatal(err)
+	}
+	pvc := &corev1.PersistentVolumeClaim{}
+	if err := base.Get(context.Background(), client.ObjectKey{Name: naming.PVC(env), Namespace: env.Namespace}, pvc); err != nil {
+		t.Fatal(err)
+	}
+	return pvc
+}
+
+func assertCondition(t *testing.T, base client.Client, name, conditionType string, status metav1.ConditionStatus, reason string) {
+	t.Helper()
+	env := &platformv1alpha1.DevelopmentEnvironment{}
+	if err := base.Get(context.Background(), client.ObjectKey{Name: name, Namespace: unitNamespace}, env); err != nil {
+		t.Fatal(err)
+	}
+	condition := meta.FindStatusCondition(env.Status.Conditions, conditionType)
+	if condition == nil || condition.Status != status || condition.Reason != reason {
+		t.Fatalf("condition %s = %#v, want status=%s reason=%s", conditionType, condition, status, reason)
+	}
+}
+
 func assertPhase(t *testing.T, base client.Client, name string, want platformv1alpha1.DevelopmentEnvironmentPhase) {
 	t.Helper()
 	env := &platformv1alpha1.DevelopmentEnvironment{}
-	if err := base.Get(context.Background(), client.ObjectKey{Name: name, Namespace: "default"}, env); err != nil {
+	if err := base.Get(context.Background(), client.ObjectKey{Name: name, Namespace: unitNamespace}, env); err != nil {
 		t.Fatal(err)
 	}
 	if env.Status.Phase != want {

@@ -3,13 +3,18 @@ package controller
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"maps"
+	"time"
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	networkingv1 "k8s.io/api/networking/v1"
+	storagev1 "k8s.io/api/storage/v1"
 	"k8s.io/apimachinery/pkg/api/equality"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/meta"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -25,12 +30,16 @@ import (
 	statusutil "github.com/hashemzargari/kimera-operator/internal/status"
 )
 
-const finalizer = "platform.kimera.dev/finalizer"
+const (
+	finalizer   = "platform.kimera.dev/finalizer"
+	logFieldPVC = "pvc"
+)
 
 // DevelopmentEnvironmentReconciler reconciles DevelopmentEnvironment resources and their children.
 type DevelopmentEnvironmentReconciler struct {
 	client.Client
-	Scheme *runtime.Scheme
+	APIReader client.Reader
+	Scheme    *runtime.Scheme
 }
 
 // +kubebuilder:rbac:groups=platform.kimera.dev,resources=developmentenvironments,verbs=get;list;watch;update;patch
@@ -40,6 +49,7 @@ type DevelopmentEnvironmentReconciler struct {
 // +kubebuilder:rbac:groups="",resources=services;persistentvolumeclaims,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups="",resources=configmaps;secrets,verbs=get;list;watch
 // +kubebuilder:rbac:groups=networking.k8s.io,resources=ingresses,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=storage.k8s.io,resources=storageclasses,verbs=get
 
 // Reconcile converges the deterministic Phase 1 child resources. API failures are returned so
 // controller-runtime retries; only invalid, unfulfillable user input is recorded as Failed.
@@ -77,6 +87,10 @@ func (r *DevelopmentEnvironmentReconciler) Reconcile(ctx context.Context, req ct
 		return ctrl.Result{}, err
 	}
 	if err := r.reconcilePVC(ctx, env); err != nil {
+		var storageIssue *terminalStorageError
+		if errors.As(err, &storageIssue) {
+			return r.recordStorageFailure(ctx, env, before, storageIssue)
+		}
 		if _, invalid := err.(*specError); invalid {
 			return r.recordInvalidSpec(ctx, env, before, err)
 		}
@@ -105,6 +119,16 @@ func (r *DevelopmentEnvironmentReconciler) Reconcile(ctx context.Context, req ct
 type specError struct{ message string }
 
 func (e *specError) Error() string { return e.message }
+
+type terminalStorageError struct {
+	phase      platformv1alpha1.DevelopmentEnvironmentPhase
+	reason     string
+	message    string
+	logMessage string
+	logFields  []any
+}
+
+func (e *terminalStorageError) Error() string { return e.message }
 
 func validateQuantities(env *platformv1alpha1.DevelopmentEnvironment) error {
 	for name, value := range map[string]resource.Quantity{"cpuRequest": env.Spec.Resources.CPURequest, "cpuLimit": env.Spec.Resources.CPULimit, "memoryRequest": env.Spec.Resources.MemoryRequest, "memoryLimit": env.Spec.Resources.MemoryLimit, "storage.size": env.Spec.Storage.Size} {
@@ -147,6 +171,7 @@ func (r *DevelopmentEnvironmentReconciler) reconcilePVC(ctx context.Context, env
 		return &specError{"metadata.uid is required to derive a safe workspace storage identity"}
 	}
 	desired := resources.DesiredPVC(env)
+	logger = logger.WithValues("pvc", desired.Name)
 	existing := &corev1.PersistentVolumeClaim{}
 	err := r.Get(ctx, client.ObjectKeyFromObject(desired), existing)
 	if apierrors.IsNotFound(err) {
@@ -159,7 +184,6 @@ func (r *DevelopmentEnvironmentReconciler) reconcilePVC(ctx context.Context, env
 			return fmt.Errorf("create workspace PVC: %w", err)
 		}
 		logger.Info("Created workspace PVC",
-			"pvc", desired.Name,
 			"retentionPolicy", env.Spec.Storage.RetentionPolicy,
 			"requestedSize", env.Spec.Storage.Size.String(),
 			"storageClass", env.Spec.Storage.StorageClassName,
@@ -171,17 +195,13 @@ func (r *DevelopmentEnvironmentReconciler) reconcilePVC(ctx context.Context, env
 		return fmt.Errorf("get PVC: %w", err)
 	}
 	if err := validatePVCIdentityAndCompatibility(existing, desired, env); err != nil {
-		logger.Info("Incompatible workspace PVC detected",
-			"pvc", existing.Name,
-			"storageIdentity", naming.StorageIdentity(env),
-			"reason", err.Error(),
-		)
 		return err
 	}
 	current := existing.Spec.Resources.Requests[corev1.ResourceStorage]
 	if env.Spec.Storage.Size.Cmp(current) < 0 {
-		err := &specError{fmt.Sprintf("requested storage %s is smaller than existing PVC size %s; shrinking is unsupported", env.Spec.Storage.Size.String(), current.String())}
-		logger.Info("Incompatible workspace PVC detected", "pvc", existing.Name, "storageIdentity", naming.StorageIdentity(env), "reason", err.Error())
+		err := storageFailure(platformv1alpha1.PhaseFailed, "VolumeShrinkUnsupported",
+			fmt.Sprintf("Requested workspace storage %s is smaller than current PVC request %s; shrinking is unsupported", env.Spec.Storage.Size.String(), current.String()),
+			"Workspace PVC shrink is unsupported", existing, current, env.Spec.Storage.Size)
 		return err
 	}
 	before := existing.DeepCopy()
@@ -200,6 +220,9 @@ func (r *DevelopmentEnvironmentReconciler) reconcilePVC(ctx context.Context, env
 	}
 	expanded := env.Spec.Storage.Size.Cmp(current) > 0
 	if expanded {
+		if err := r.validatePVCExpansion(ctx, existing, current, env.Spec.Storage.Size); err != nil {
+			return err
+		}
 		existing.Spec.Resources.Requests[corev1.ResourceStorage] = env.Spec.Storage.Size
 	}
 	if ownershipChanged || expanded {
@@ -207,13 +230,13 @@ func (r *DevelopmentEnvironmentReconciler) reconcilePVC(ctx context.Context, env
 			return fmt.Errorf("patch PVC: %w", err)
 		}
 		if ownershipChanged {
-			logger.Info("Updated workspace PVC controller ownership", "pvc", existing.Name, "retentionPolicy", env.Spec.Storage.RetentionPolicy, "storageIdentity", naming.StorageIdentity(env))
+			logger.Info("Updated workspace PVC controller ownership", "retentionPolicy", env.Spec.Storage.RetentionPolicy, "storageIdentity", naming.StorageIdentity(env))
 		}
 		if expanded {
-			logger.Info("Expanded workspace PVC", "pvc", existing.Name, "previousSize", current.String(), "requestedSize", env.Spec.Storage.Size.String(), "storageIdentity", naming.StorageIdentity(env))
+			logger.Info("Expanded workspace PVC", "previousSize", current.String(), "requestedSize", env.Spec.Storage.Size.String(), "storageIdentity", naming.StorageIdentity(env))
 		}
 	} else {
-		logger.V(2).Info("Workspace PVC for current storage identity is already reconciled", "pvc", existing.Name, "storageIdentity", naming.StorageIdentity(env))
+		logger.V(2).Info("Workspace PVC for current storage identity is already reconciled", "storageIdentity", naming.StorageIdentity(env))
 	}
 	return nil
 }
@@ -225,19 +248,62 @@ func validatePVCIdentityAndCompatibility(existing, desired *corev1.PersistentVol
 		existing.Annotations[naming.OriginalEnvironmentUIDAnnotation] != identity ||
 		existing.Annotations[naming.StorageIdentityAnnotation] != identity ||
 		existing.Annotations[naming.OriginalEnvironmentNameAnnotation] != env.Name {
-		return &specError{fmt.Sprintf("PVC %q does not have provenance for DevelopmentEnvironment UID %q; refusing automatic adoption", existing.Name, identity)}
+		return &terminalStorageError{phase: platformv1alpha1.PhaseFailed, reason: "StorageIdentityMismatch", message: fmt.Sprintf("PVC %q does not have provenance for DevelopmentEnvironment UID %q; refusing automatic adoption", existing.Name, identity), logMessage: "Workspace PVC identity is incompatible", logFields: []any{logFieldPVC, existing.Name, "storageIdentity", identity}}
 	}
 	if env.Spec.Storage.StorageClassName != "" && (existing.Spec.StorageClassName == nil || *existing.Spec.StorageClassName != env.Spec.Storage.StorageClassName) {
 		actual := ""
 		if existing.Spec.StorageClassName != nil {
 			actual = *existing.Spec.StorageClassName
 		}
-		return &specError{fmt.Sprintf("PVC %q uses storageClassName %q, requested %q; storageClassName is immutable", existing.Name, actual, env.Spec.Storage.StorageClassName)}
+		return &terminalStorageError{phase: platformv1alpha1.PhaseFailed, reason: "StorageClassImmutable", message: fmt.Sprintf("PVC %q uses StorageClass %q, requested %q; storageClassName is immutable", existing.Name, actual, env.Spec.Storage.StorageClassName), logMessage: "Workspace PVC StorageClass is immutable", logFields: []any{logFieldPVC, existing.Name, "currentStorageClass", actual, "requestedStorageClass", env.Spec.Storage.StorageClassName}}
 	}
 	if !equality.Semantic.DeepEqual(existing.Spec.AccessModes, desired.Spec.AccessModes) {
-		return &specError{fmt.Sprintf("PVC %q access modes %v do not match required access modes %v", existing.Name, existing.Spec.AccessModes, desired.Spec.AccessModes)}
+		return &terminalStorageError{phase: platformv1alpha1.PhaseFailed, reason: "AccessModesIncompatible", message: fmt.Sprintf("PVC %q access modes %v do not match required access modes %v", existing.Name, existing.Spec.AccessModes, desired.Spec.AccessModes), logMessage: "Workspace PVC access modes are incompatible", logFields: []any{logFieldPVC, existing.Name}}
 	}
 	return nil
+}
+
+func (r *DevelopmentEnvironmentReconciler) validatePVCExpansion(ctx context.Context, pvc *corev1.PersistentVolumeClaim, current, requested resource.Quantity) error {
+	if pvc.Status.Phase != corev1.ClaimBound {
+		return storageFailure(platformv1alpha1.PhaseDegraded, "VolumeExpansionUnsupported",
+			fmt.Sprintf("Requested workspace storage %s exceeds current %s, but PVC %q is %s; only Bound PVCs can be expanded", requested.String(), current.String(), pvc.Name, pvc.Status.Phase),
+			"Workspace PVC expansion is unsupported", pvc, current, requested)
+	}
+	storageClassName := ""
+	if pvc.Spec.StorageClassName != nil {
+		storageClassName = *pvc.Spec.StorageClassName
+	}
+	if storageClassName == "" {
+		return storageFailure(platformv1alpha1.PhaseDegraded, "VolumeExpansionUnsupported",
+			fmt.Sprintf("Requested workspace storage %s exceeds current %s, but PVC %q has no StorageClass and is not eligible for expansion", requested.String(), current.String(), pvc.Name),
+			"Workspace PVC expansion is unsupported", pvc, current, requested)
+	}
+	storageClass := &storagev1.StorageClass{}
+	reader := r.APIReader
+	if reader == nil {
+		reader = r.Client
+	}
+	if err := reader.Get(ctx, client.ObjectKey{Name: storageClassName}, storageClass); apierrors.IsNotFound(err) {
+		return storageFailure(platformv1alpha1.PhaseDegraded, "VolumeExpansionUnsupported",
+			fmt.Sprintf("Requested workspace storage %s exceeds current %s, but StorageClass %q does not exist", requested.String(), current.String(), storageClassName),
+			"Workspace PVC expansion is unsupported", pvc, current, requested)
+	} else if err != nil {
+		return fmt.Errorf("get StorageClass %q for PVC expansion: %w", storageClassName, err)
+	}
+	if storageClass.Provisioner == "kubernetes.io/no-provisioner" || storageClass.AllowVolumeExpansion == nil || !*storageClass.AllowVolumeExpansion {
+		return storageFailure(platformv1alpha1.PhaseDegraded, "VolumeExpansionUnsupported",
+			fmt.Sprintf("Requested workspace storage %s exceeds current %s, but StorageClass %q does not support volume expansion", requested.String(), current.String(), storageClassName),
+			"Workspace PVC expansion is unsupported", pvc, current, requested)
+	}
+	return nil
+}
+
+func storageFailure(phase platformv1alpha1.DevelopmentEnvironmentPhase, reason, message, logMessage string, pvc *corev1.PersistentVolumeClaim, current, requested resource.Quantity) *terminalStorageError {
+	storageClass := ""
+	if pvc.Spec.StorageClassName != nil {
+		storageClass = *pvc.Spec.StorageClassName
+	}
+	return &terminalStorageError{phase: phase, reason: reason, message: message, logMessage: logMessage, logFields: []any{logFieldPVC, pvc.Name, "currentSize", current.String(), "requestedSize", requested.String(), "storageClass", storageClass}}
 }
 
 func (r *DevelopmentEnvironmentReconciler) reconcileOwned(ctx context.Context, env *platformv1alpha1.DevelopmentEnvironment, desired client.Object) error {
@@ -250,9 +316,7 @@ func (r *DevelopmentEnvironmentReconciler) reconcileOwned(ctx context.Context, e
 		if labels == nil {
 			labels = map[string]string{}
 		}
-		for key, value := range expected.GetLabels() {
-			labels[key] = value
-		}
+		maps.Copy(labels, expected.GetLabels())
 		desired.SetLabels(labels)
 		switch actual := desired.(type) {
 		case *appsv1.Deployment:
@@ -260,9 +324,27 @@ func (r *DevelopmentEnvironmentReconciler) reconcileOwned(ctx context.Context, e
 			if !actual.CreationTimestamp.IsZero() && !equality.Semantic.DeepEqual(actual.Spec.Selector, wanted.Spec.Selector) {
 				return fmt.Errorf("managed Deployment selector differs from the immutable desired selector")
 			}
-			actual.Spec.Replicas = wanted.Spec.Replicas
-			actual.Spec.Selector = wanted.Spec.Selector
-			actual.Spec.Template = wanted.Spec.Template
+			if actual.CreationTimestamp.IsZero() {
+				actual.Spec.Selector = wanted.Spec.Selector
+			}
+			if !equality.Semantic.DeepEqual(actual.Spec.Replicas, wanted.Spec.Replicas) {
+				actual.Spec.Replicas = wanted.Spec.Replicas
+			}
+			templateLabels := actual.Spec.Template.Labels
+			if templateLabels == nil {
+				templateLabels = map[string]string{}
+			}
+			maps.Copy(templateLabels, wanted.Spec.Template.Labels)
+			actual.Spec.Template.Labels = templateLabels
+			if !equality.Semantic.DeepEqual(actual.Spec.Template.Spec.SecurityContext, wanted.Spec.Template.Spec.SecurityContext) {
+				actual.Spec.Template.Spec.SecurityContext = wanted.Spec.Template.Spec.SecurityContext
+			}
+			if !equality.Semantic.DeepEqual(actual.Spec.Template.Spec.Containers, wanted.Spec.Template.Spec.Containers) {
+				actual.Spec.Template.Spec.Containers = wanted.Spec.Template.Spec.Containers
+			}
+			if !equality.Semantic.DeepEqual(actual.Spec.Template.Spec.Volumes, wanted.Spec.Template.Spec.Volumes) {
+				actual.Spec.Template.Spec.Volumes = wanted.Spec.Template.Spec.Volumes
+			}
 		case *corev1.Service:
 			wanted := expected.(*corev1.Service)
 			actual.Spec.Type = wanted.Spec.Type
@@ -270,6 +352,9 @@ func (r *DevelopmentEnvironmentReconciler) reconcileOwned(ctx context.Context, e
 			actual.Spec.Ports = wanted.Spec.Ports
 		case *networkingv1.Ingress:
 			actual.Spec.Rules = expected.(*networkingv1.Ingress).Spec.Rules
+		}
+		if metav1.IsControlledBy(desired, env) {
+			return nil
 		}
 		return controllerutil.SetControllerReference(env, desired, r.Scheme)
 	})
@@ -308,7 +393,11 @@ func (r *DevelopmentEnvironmentReconciler) setReadiness(ctx context.Context, env
 	if err := r.Get(ctx, types.NamespacedName{Namespace: env.Namespace, Name: naming.PVC(env)}, pvc); err != nil && !apierrors.IsNotFound(err) {
 		return fmt.Errorf("observe PVC: %w", err)
 	}
-	storageReady := pvc.Status.Phase == corev1.ClaimBound
+	requestedStorage := pvc.Spec.Resources.Requests[corev1.ResourceStorage]
+	availableStorage := pvc.Status.Capacity[corev1.ResourceStorage]
+	storageReady := pvc.Status.Phase == corev1.ClaimBound &&
+		requestedStorage.Cmp(env.Spec.Storage.Size) >= 0 &&
+		availableStorage.Cmp(env.Spec.Storage.Size) >= 0
 	deployment := &appsv1.Deployment{}
 	if err := r.Get(ctx, types.NamespacedName{Namespace: env.Namespace, Name: naming.Deployment(env)}, deployment); err != nil && !apierrors.IsNotFound(err) {
 		return fmt.Errorf("observe Deployment: %w", err)
@@ -335,7 +424,9 @@ func (r *DevelopmentEnvironmentReconciler) setReadiness(ctx context.Context, env
 		env.Status.EnvironmentURL = ""
 	}
 	storageMessage := "Workspace PVC is not Bound"
-	if storageReady {
+	if pvc.Status.Phase == corev1.ClaimBound && !storageReady {
+		storageMessage = fmt.Sprintf("Workspace PVC does not yet provide requested storage %s", env.Spec.Storage.Size.String())
+	} else if storageReady {
 		storageMessage = "Workspace PVC is Bound"
 	}
 	workloadMessage := "IDE Deployment has no available replicas"
@@ -405,6 +496,23 @@ func (r *DevelopmentEnvironmentReconciler) recordInvalidSpec(ctx context.Context
 	return ctrl.Result{}, r.writeStatus(ctx, before, env)
 }
 
+func (r *DevelopmentEnvironmentReconciler) recordStorageFailure(ctx context.Context, env, before *platformv1alpha1.DevelopmentEnvironment, issue *terminalStorageError) (ctrl.Result, error) {
+	condition := meta.FindStatusCondition(env.Status.Conditions, statusutil.StorageReady)
+	transition := env.Status.Phase != issue.phase || env.Status.ObservedGeneration != env.Generation || condition == nil || condition.Status != metav1.ConditionFalse || condition.Reason != issue.reason || condition.Message != issue.message
+	env.Status.Phase = issue.phase
+	env.Status.ObservedGeneration = env.Generation
+	statusutil.Set(env, statusutil.StorageReady, metav1.ConditionFalse, issue.reason, issue.message)
+	statusutil.Set(env, statusutil.Ready, metav1.ConditionFalse, issue.reason, issue.message)
+	statusutil.Set(env, statusutil.Progressing, metav1.ConditionFalse, issue.reason, issue.message)
+	if err := r.writeStatus(ctx, before, env); err != nil {
+		return ctrl.Result{}, err
+	}
+	if transition {
+		ctrl.LoggerFrom(ctx).Info(issue.logMessage, issue.logFields...)
+	}
+	return ctrl.Result{}, nil
+}
+
 func (r *DevelopmentEnvironmentReconciler) reconcileDelete(ctx context.Context, env *platformv1alpha1.DevelopmentEnvironment) (ctrl.Result, error) {
 	logger := ctrl.LoggerFrom(ctx)
 	logger.V(1).Info("Reconciling DevelopmentEnvironment deletion", "retentionPolicy", env.Spec.Storage.RetentionPolicy)
@@ -414,7 +522,8 @@ func (r *DevelopmentEnvironmentReconciler) reconcileDelete(ctx context.Context, 
 		if err := r.Get(ctx, client.ObjectKeyFromObject(pvc), existing); err != nil && !apierrors.IsNotFound(err) {
 			return ctrl.Result{}, err
 		} else if err == nil && metav1.IsControlledBy(existing, env) {
-			logger.Info("Retaining workspace PVC", "pvc", existing.Name, "storageIdentity", naming.StorageIdentity(env))
+			pvcLogger := logger.WithValues("pvc", existing.Name)
+			pvcLogger.Info("Retaining workspace PVC", "storageIdentity", naming.StorageIdentity(env))
 			before := existing.DeepCopy()
 			if err := controllerutil.RemoveControllerReference(env, existing, r.Scheme); err != nil {
 				return ctrl.Result{}, err
@@ -424,10 +533,10 @@ func (r *DevelopmentEnvironmentReconciler) reconcileDelete(ctx context.Context, 
 			} else if err != nil {
 				return ctrl.Result{}, err
 			} else {
-				logger.Info("Removed controller ownership from retained workspace PVC", "pvc", existing.Name, "storageIdentity", naming.StorageIdentity(env))
+				pvcLogger.Info("Removed controller ownership from retained workspace PVC", "storageIdentity", naming.StorageIdentity(env))
 			}
 		} else if err == nil {
-			logger.V(2).Info("Retained workspace PVC is already detached", "pvc", existing.Name, "storageIdentity", naming.StorageIdentity(env))
+			logger.WithValues("pvc", existing.Name).V(2).Info("Retained workspace PVC is already detached", "storageIdentity", naming.StorageIdentity(env))
 		}
 	}
 	objects := []client.Object{resources.DesiredDeployment(env), resources.DesiredService(env), resources.DesiredIngress(env)}
@@ -440,7 +549,7 @@ func (r *DevelopmentEnvironmentReconciler) reconcileDelete(ctx context.Context, 
 			return ctrl.Result{}, err
 		}
 		if !done {
-			return ctrl.Result{Requeue: true}, nil
+			return ctrl.Result{RequeueAfter: time.Second}, nil
 		}
 	}
 	before := env.DeepCopy()
@@ -457,7 +566,7 @@ func (r *DevelopmentEnvironmentReconciler) deleteAndConfirm(ctx context.Context,
 	}
 	if object.GetDeletionTimestamp().IsZero() {
 		if pvc, ok := object.(*corev1.PersistentVolumeClaim); ok {
-			ctrl.LoggerFrom(ctx).Info("Deleting workspace PVC", "pvc", pvc.Name, "storageIdentity", pvc.Annotations[naming.StorageIdentityAnnotation])
+			ctrl.LoggerFrom(ctx).WithValues("pvc", pvc.Name).Info("Deleting workspace PVC", "storageIdentity", pvc.Annotations[naming.StorageIdentityAnnotation])
 		}
 		if err := r.Delete(ctx, object); apierrors.IsNotFound(err) {
 			return true, nil
