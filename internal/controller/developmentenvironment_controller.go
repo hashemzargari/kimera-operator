@@ -40,7 +40,8 @@ type DevelopmentEnvironmentReconciler struct {
 // +kubebuilder:rbac:groups="",resources=configmaps;secrets,verbs=get;list;watch
 // +kubebuilder:rbac:groups=networking.k8s.io,resources=ingresses,verbs=get;list;watch;create;update;patch;delete
 
-// Reconcile makes the deterministic PVC, Deployment, Service, and optional Ingress match the spec.
+// Reconcile converges the deterministic Phase 1 child resources. API failures are returned so
+// controller-runtime retries; only invalid, unfulfillable user input is recorded as Failed.
 func (r *DevelopmentEnvironmentReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	env := &platformv1alpha1.DevelopmentEnvironment{}
 	if err := r.Get(ctx, req.NamespacedName, env); err != nil {
@@ -53,49 +54,54 @@ func (r *DevelopmentEnvironmentReconciler) Reconcile(ctx context.Context, req ct
 		controllerutil.AddFinalizer(env, finalizer)
 		return ctrl.Result{}, r.Update(ctx, env)
 	}
+
 	before := env.DeepCopy()
-	env.Status.Phase = platformv1alpha1.PhaseProvisioning
-	statusutil.Set(env, statusutil.Progressing, metav1.ConditionTrue, "Reconciling", "Reconciling desired resources")
 	if err := validateQuantities(env); err != nil {
-		return r.failStatus(ctx, env, before, err)
+		return r.recordInvalidSpec(ctx, env, before, err)
 	}
-	refsOK, refMessage, err := r.referencesExist(ctx, env)
+	refsReady, refsMessage, err := r.referencesExist(ctx, env)
 	if err != nil {
 		return ctrl.Result{}, err
 	}
 	if err := r.reconcilePVC(ctx, env); err != nil {
-		return r.failStatus(ctx, env, before, err)
+		if _, invalid := err.(*specError); invalid {
+			return r.recordInvalidSpec(ctx, env, before, err)
+		}
+		return ctrl.Result{}, err
 	}
 	if err := r.reconcileOwned(ctx, env, resources.DesiredDeployment(env)); err != nil {
-		return r.failStatus(ctx, env, before, err)
+		return ctrl.Result{}, fmt.Errorf("reconcile Deployment: %w", err)
 	}
 	if err := r.reconcileOwned(ctx, env, resources.DesiredService(env)); err != nil {
-		return r.failStatus(ctx, env, before, err)
+		return ctrl.Result{}, fmt.Errorf("reconcile Service: %w", err)
 	}
 	if env.Spec.Network.Enabled {
 		if err := r.reconcileOwned(ctx, env, resources.DesiredIngress(env)); err != nil {
-			return r.failStatus(ctx, env, before, err)
+			return ctrl.Result{}, fmt.Errorf("reconcile Ingress: %w", err)
 		}
 	} else if err := r.Delete(ctx, resources.DesiredIngress(env)); client.IgnoreNotFound(err) != nil {
-		return ctrl.Result{}, fmt.Errorf("delete disabled ingress: %w", err)
+		return ctrl.Result{}, fmt.Errorf("delete disabled Ingress: %w", err)
 	}
-	r.setReadiness(ctx, env, refsOK, refMessage)
-	if !equality.Semantic.DeepEqual(before.Status, env.Status) {
-		if err := r.Status().Patch(ctx, env, client.MergeFrom(before)); err != nil {
-			return ctrl.Result{}, fmt.Errorf("update status: %w", err)
-		}
+
+	if err := r.setReadiness(ctx, env, before.Status.Phase == platformv1alpha1.PhaseReady, refsReady, refsMessage); err != nil {
+		return ctrl.Result{}, err
 	}
-	return ctrl.Result{}, nil
+	return ctrl.Result{}, r.writeStatus(ctx, before, env)
 }
+
+type specError struct{ message string }
+
+func (e *specError) Error() string { return e.message }
 
 func validateQuantities(env *platformv1alpha1.DevelopmentEnvironment) error {
 	for name, value := range map[string]resource.Quantity{"cpuRequest": env.Spec.Resources.CPURequest, "cpuLimit": env.Spec.Resources.CPULimit, "memoryRequest": env.Spec.Resources.MemoryRequest, "memoryLimit": env.Spec.Resources.MemoryLimit, "storage.size": env.Spec.Storage.Size} {
 		if value.Sign() <= 0 {
-			return fmt.Errorf("spec.%s must be positive", name)
+			return &specError{fmt.Sprintf("spec.%s must be positive", name)}
 		}
 	}
 	return nil
 }
+
 func (r *DevelopmentEnvironmentReconciler) referencesExist(ctx context.Context, env *platformv1alpha1.DevelopmentEnvironment) (bool, string, error) {
 	if env.Spec.ConfigMapRef != nil {
 		if err := r.Get(ctx, types.NamespacedName{Namespace: env.Namespace, Name: env.Spec.ConfigMapRef.Name}, &corev1.ConfigMap{}); err != nil {
@@ -115,12 +121,19 @@ func (r *DevelopmentEnvironmentReconciler) referencesExist(ctx context.Context, 
 	}
 	return true, "", nil
 }
+
+func deletePVC(env *platformv1alpha1.DevelopmentEnvironment) bool {
+	return env.Spec.Storage.RetentionPolicy == "Delete"
+}
+
+// reconcilePVC changes only the storage request. PVCs cannot be shrunk, and StorageClass is
+// intentionally immutable after creation because changing it would require a replacement claim.
 func (r *DevelopmentEnvironmentReconciler) reconcilePVC(ctx context.Context, env *platformv1alpha1.DevelopmentEnvironment) error {
 	desired := resources.DesiredPVC(env)
 	existing := &corev1.PersistentVolumeClaim{}
 	err := r.Get(ctx, client.ObjectKeyFromObject(desired), existing)
 	if apierrors.IsNotFound(err) {
-		if env.Spec.Storage.RetentionPolicy == "Delete" {
+		if deletePVC(env) {
 			if err := controllerutil.SetControllerReference(env, desired, r.Scheme); err != nil {
 				return err
 			}
@@ -130,16 +143,15 @@ func (r *DevelopmentEnvironmentReconciler) reconcilePVC(ctx context.Context, env
 	if err != nil {
 		return fmt.Errorf("get PVC: %w", err)
 	}
-	if env.Spec.Storage.RetentionPolicy == "Retain" && metav1.IsControlledBy(existing, env) {
-		// A policy change must remove an old controller reference before deletion can
-		// preserve the claim. This is safe because this controller is the only owner it adds.
+	if !deletePVC(env) && metav1.IsControlledBy(existing, env) {
 		if err := controllerutil.RemoveControllerReference(env, existing, r.Scheme); err != nil {
 			return fmt.Errorf("remove PVC controller reference: %w", err)
 		}
 		if err := r.Update(ctx, existing); err != nil {
 			return fmt.Errorf("detach retained PVC: %w", err)
 		}
-	} else if !metav1.IsControlledBy(existing, env) {
+	}
+	if deletePVC(env) && !metav1.IsControlledBy(existing, env) {
 		if err := controllerutil.SetControllerReference(env, existing, r.Scheme); err != nil {
 			return fmt.Errorf("set PVC controller reference: %w", err)
 		}
@@ -149,7 +161,7 @@ func (r *DevelopmentEnvironmentReconciler) reconcilePVC(ctx context.Context, env
 	}
 	current := existing.Spec.Resources.Requests[corev1.ResourceStorage]
 	if env.Spec.Storage.Size.Cmp(current) < 0 {
-		return fmt.Errorf("requested storage %s is smaller than existing PVC size %s; shrinking is unsupported", env.Spec.Storage.Size.String(), current.String())
+		return &specError{fmt.Sprintf("requested storage %s is smaller than existing PVC size %s; shrinking is unsupported", env.Spec.Storage.Size.String(), current.String())}
 	}
 	if env.Spec.Storage.Size.Cmp(current) > 0 {
 		existing.Spec.Resources.Requests[corev1.ResourceStorage] = env.Spec.Storage.Size
@@ -159,6 +171,7 @@ func (r *DevelopmentEnvironmentReconciler) reconcilePVC(ctx context.Context, env
 	}
 	return nil
 }
+
 func (r *DevelopmentEnvironmentReconciler) reconcileOwned(ctx context.Context, env *platformv1alpha1.DevelopmentEnvironment, desired client.Object) error {
 	expected := desired.DeepCopyObject().(client.Object)
 	_, err := controllerutil.CreateOrUpdate(ctx, r.Client, desired, func() error {
@@ -167,10 +180,12 @@ func (r *DevelopmentEnvironmentReconciler) reconcileOwned(ctx context.Context, e
 		case *appsv1.Deployment:
 			actual.Spec = expected.(*appsv1.Deployment).Spec
 		case *corev1.Service:
-			// ClusterIP is allocated by Kubernetes and must be preserved on update.
-			clusterIP := actual.Spec.ClusterIP
+			old := actual.Spec
 			actual.Spec = expected.(*corev1.Service).Spec
-			actual.Spec.ClusterIP = clusterIP
+			// These values are allocated/defaulted by the API server and cannot safely be replaced.
+			actual.Spec.ClusterIP, actual.Spec.ClusterIPs = old.ClusterIP, old.ClusterIPs
+			actual.Spec.IPFamilies, actual.Spec.IPFamilyPolicy = old.IPFamilies, old.IPFamilyPolicy
+			actual.Spec.HealthCheckNodePort = old.HealthCheckNodePort
 		case *networkingv1.Ingress:
 			actual.Spec = expected.(*networkingv1.Ingress).Spec
 		}
@@ -178,70 +193,134 @@ func (r *DevelopmentEnvironmentReconciler) reconcileOwned(ctx context.Context, e
 	})
 	return err
 }
-func (r *DevelopmentEnvironmentReconciler) setReadiness(ctx context.Context, env *platformv1alpha1.DevelopmentEnvironment, refsOK bool, refMessage string) {
+
+func (r *DevelopmentEnvironmentReconciler) setReadiness(ctx context.Context, env *platformv1alpha1.DevelopmentEnvironment, wasReady, refsReady bool, refsMessage string) error {
 	pvc := &corev1.PersistentVolumeClaim{}
-	_ = r.Get(ctx, types.NamespacedName{Namespace: env.Namespace, Name: naming.PVC(env)}, pvc)
+	if err := r.Get(ctx, types.NamespacedName{Namespace: env.Namespace, Name: naming.PVC(env)}, pvc); err != nil && !apierrors.IsNotFound(err) {
+		return fmt.Errorf("observe PVC: %w", err)
+	}
 	storageReady := pvc.Status.Phase == corev1.ClaimBound
 	deployment := &appsv1.Deployment{}
-	_ = r.Get(ctx, types.NamespacedName{Namespace: env.Namespace, Name: naming.Deployment(env)}, deployment)
-	workloadReady := deployment.Status.AvailableReplicas >= 1
+	if err := r.Get(ctx, types.NamespacedName{Namespace: env.Namespace, Name: naming.Deployment(env)}, deployment); err != nil && !apierrors.IsNotFound(err) {
+		return fmt.Errorf("observe Deployment: %w", err)
+	}
+	desiredReplicas := int32(1)
+	if deployment.Spec.Replicas != nil {
+		desiredReplicas = *deployment.Spec.Replicas
+	}
+	workloadReady := deployment.Status.AvailableReplicas >= desiredReplicas
+	service := &corev1.Service{}
+	if err := r.Get(ctx, types.NamespacedName{Namespace: env.Namespace, Name: naming.Service(env)}, service); err != nil && !apierrors.IsNotFound(err) {
+		return fmt.Errorf("observe Service: %w", err)
+	}
+	serviceReady := service.Name != ""
 	networkReady := !env.Spec.Network.Enabled
 	if env.Spec.Network.Enabled {
 		ingress := &networkingv1.Ingress{}
-		networkReady = r.Get(ctx, types.NamespacedName{Namespace: env.Namespace, Name: naming.Ingress(env)}, ingress) == nil
-		env.Status.EnvironmentURL = "https://" + env.Spec.Network.Host
+		if err := r.Get(ctx, types.NamespacedName{Namespace: env.Namespace, Name: naming.Ingress(env)}, ingress); err != nil && !apierrors.IsNotFound(err) {
+			return fmt.Errorf("observe Ingress: %w", err)
+		}
+		networkReady = ingress.Name != ""
+		env.Status.EnvironmentURL = "http://" + env.Spec.Network.Host
 	} else {
 		env.Status.EnvironmentURL = ""
 	}
-	statusutil.Set(env, statusutil.StorageReady, condition(storageReady), "PVCObserved", "Workspace PVC is observed")
-	statusutil.Set(env, statusutil.WorkloadReady, condition(workloadReady), "DeploymentObserved", "IDE Deployment is observed")
-	statusutil.Set(env, statusutil.NetworkReady, condition(networkReady), "IngressObserved", "Network configuration is observed")
+	statusutil.Set(env, statusutil.StorageReady, condition(storageReady), "PVCObserved", "Workspace PVC is Bound")
+	statusutil.Set(env, statusutil.WorkloadReady, condition(workloadReady), "DeploymentObserved", "IDE Deployment availability was observed")
+	statusutil.Set(env, statusutil.NetworkReady, condition(networkReady), "IngressObserved", "Network configuration was observed")
 	env.Status.ObservedGeneration = env.Generation
-	if storageReady && workloadReady && networkReady && refsOK {
+	allReady := storageReady && workloadReady && serviceReady && networkReady && refsReady
+	if allReady {
 		env.Status.Phase = platformv1alpha1.PhaseReady
 		statusutil.Set(env, statusutil.Ready, metav1.ConditionTrue, "ResourcesReady", "DevelopmentEnvironment is ready")
 		statusutil.Set(env, statusutil.Progressing, metav1.ConditionFalse, "Reconciled", "Desired resources are ready")
-	} else {
-		env.Status.Phase = platformv1alpha1.PhaseDegraded
-		msg := "Waiting for child resources"
-		if !refsOK {
-			msg = refMessage
-		}
-		statusutil.Set(env, statusutil.Ready, metav1.ConditionFalse, "NotReady", msg)
+		return nil
 	}
+	message := "Waiting for PVC, Deployment, Service, or Ingress readiness"
+	if !refsReady {
+		message = refsMessage
+	}
+	if wasReady {
+		env.Status.Phase = platformv1alpha1.PhaseDegraded
+		statusutil.Set(env, statusutil.Ready, metav1.ConditionFalse, "HealthLost", message)
+		statusutil.Set(env, statusutil.Progressing, metav1.ConditionFalse, "Degraded", message)
+	} else {
+		env.Status.Phase = platformv1alpha1.PhaseProvisioning
+		statusutil.Set(env, statusutil.Ready, metav1.ConditionFalse, "Provisioning", message)
+		statusutil.Set(env, statusutil.Progressing, metav1.ConditionTrue, "Provisioning", message)
+	}
+	return nil
 }
+
 func condition(ok bool) metav1.ConditionStatus {
 	if ok {
 		return metav1.ConditionTrue
 	}
 	return metav1.ConditionFalse
 }
-func (r *DevelopmentEnvironmentReconciler) failStatus(ctx context.Context, env, before *platformv1alpha1.DevelopmentEnvironment, reconcileErr error) (ctrl.Result, error) {
+func (r *DevelopmentEnvironmentReconciler) writeStatus(ctx context.Context, before, env *platformv1alpha1.DevelopmentEnvironment) error {
+	if equality.Semantic.DeepEqual(before.Status, env.Status) {
+		return nil
+	}
+	if err := r.Status().Patch(ctx, env, client.MergeFrom(before)); err != nil {
+		return fmt.Errorf("update status: %w", err)
+	}
+	return nil
+}
+func (r *DevelopmentEnvironmentReconciler) recordInvalidSpec(ctx context.Context, env, before *platformv1alpha1.DevelopmentEnvironment, reconcileErr error) (ctrl.Result, error) {
 	env.Status.Phase = platformv1alpha1.PhaseFailed
 	env.Status.ObservedGeneration = env.Generation
 	statusutil.Set(env, statusutil.Ready, metav1.ConditionFalse, "InvalidSpecification", reconcileErr.Error())
 	statusutil.Set(env, statusutil.Progressing, metav1.ConditionFalse, "Failed", reconcileErr.Error())
-	if err := r.Status().Patch(ctx, env, client.MergeFrom(before)); err != nil {
-		return ctrl.Result{}, fmt.Errorf("update failed status: %w", err)
-	}
-	return ctrl.Result{}, nil
+	return ctrl.Result{}, r.writeStatus(ctx, before, env)
 }
+
 func (r *DevelopmentEnvironmentReconciler) reconcileDelete(ctx context.Context, env *platformv1alpha1.DevelopmentEnvironment) (ctrl.Result, error) {
-	for _, obj := range []client.Object{resources.DesiredDeployment(env), resources.DesiredService(env), resources.DesiredIngress(env)} {
-		if err := r.Delete(ctx, obj); client.IgnoreNotFound(err) != nil {
-			return ctrl.Result{}, fmt.Errorf("delete managed resource: %w", err)
+	if !deletePVC(env) {
+		pvc := resources.DesiredPVC(env)
+		existing := &corev1.PersistentVolumeClaim{}
+		if err := r.Get(ctx, client.ObjectKeyFromObject(pvc), existing); err != nil && !apierrors.IsNotFound(err) {
+			return ctrl.Result{}, err
+		} else if err == nil && metav1.IsControlledBy(existing, env) {
+			if err := controllerutil.RemoveControllerReference(env, existing, r.Scheme); err != nil {
+				return ctrl.Result{}, err
+			}
+			if err := r.Update(ctx, existing); err != nil {
+				return ctrl.Result{}, err
+			}
 		}
 	}
-	if env.Spec.Storage.RetentionPolicy == "Delete" {
-		if err := r.Delete(ctx, resources.DesiredPVC(env)); client.IgnoreNotFound(err) != nil {
-			return ctrl.Result{}, fmt.Errorf("delete workspace PVC: %w", err)
+	objects := []client.Object{resources.DesiredDeployment(env), resources.DesiredService(env), resources.DesiredIngress(env)}
+	if deletePVC(env) {
+		objects = append(objects, resources.DesiredPVC(env))
+	}
+	for _, object := range objects {
+		done, err := r.deleteAndConfirm(ctx, object)
+		if err != nil {
+			return ctrl.Result{}, err
+		}
+		if !done {
+			return ctrl.Result{Requeue: true}, nil
 		}
 	}
 	controllerutil.RemoveFinalizer(env, finalizer)
 	return ctrl.Result{}, r.Update(ctx, env)
 }
+func (r *DevelopmentEnvironmentReconciler) deleteAndConfirm(ctx context.Context, object client.Object) (bool, error) {
+	if err := r.Delete(ctx, object); client.IgnoreNotFound(err) != nil {
+		return false, fmt.Errorf("delete %T: %w", object, err)
+	}
+	err := r.Get(ctx, client.ObjectKeyFromObject(object), object)
+	if apierrors.IsNotFound(err) {
+		return true, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("confirm deletion of %T: %w", object, err)
+	}
+	return false, nil
+}
 
-// SetupWithManager watches owned children so manual deployment deletion is repaired.
+// SetupWithManager watches owned children so their deletion or drift enqueues the parent and is repaired.
 func (r *DevelopmentEnvironmentReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).For(&platformv1alpha1.DevelopmentEnvironment{}).Owns(&appsv1.Deployment{}).Owns(&corev1.Service{}).Owns(&corev1.PersistentVolumeClaim{}).Owns(&networkingv1.Ingress{}).Named("developmentenvironment").Complete(r)
 }

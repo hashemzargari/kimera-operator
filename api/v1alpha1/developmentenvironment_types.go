@@ -72,15 +72,16 @@ type StorageSpec struct {
 // NetworkSpec configures optional HTTP ingress for the environment.
 type NetworkSpec struct {
 	// Enabled creates an Ingress when true.
+	// +kubebuilder:default=false
 	Enabled bool `json:"enabled,omitempty"`
 	// Host is the DNS host served by the Ingress.
 	// +kubebuilder:validation:MaxLength=253
-	// +kubebuilder:validation:Pattern=`^([a-z0-9]([-a-z0-9]*[a-z0-9])?)(\\.([a-z0-9]([-a-z0-9]*[a-z0-9])?))*$`
+// +kubebuilder:validation:Pattern=`^([a-z0-9]([-a-z0-9]*[a-z0-9])?)(\.([a-z0-9]([-a-z0-9]*[a-z0-9])?))*$`
 	Host string `json:"host,omitempty"`
 }
 
 // DevelopmentEnvironmentSpec defines the desired state of a DevelopmentEnvironment.
-// +kubebuilder:validation:XValidation:rule="!self.network.enabled || self.network.host != ”",message="network.host is required when network.enabled is true"
+// +kubebuilder:validation:XValidation:rule="!has(self.network) || !has(self.network.enabled) || self.network.enabled == false || (has(self.network.host) && size(self.network.host) > 0)",message="network.host is required when network.enabled is true"
 type DevelopmentEnvironmentSpec struct {
 	// Image is the container image for the IDE workload.
 	// +kubebuilder:validation:MinLength=1

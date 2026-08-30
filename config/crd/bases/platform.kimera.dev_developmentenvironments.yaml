@@ -64,12 +64,13 @@ spec:
                 description: Network configures optional ingress. It defaults to disabled.
                 properties:
                   enabled:
+                    default: false
                     description: Enabled creates an Ingress when true.
                     type: boolean
                   host:
                     description: Host is the DNS host served by the Ingress.
                     maxLength: 253
-                    pattern: ^([a-z0-9]([-a-z0-9]*[a-z0-9])?)(\\.([a-z0-9]([-a-z0-9]*[a-z0-9])?))*$
+                    pattern: ^([a-z0-9]([-a-z0-9]*[a-z0-9])?)(\.([a-z0-9]([-a-z0-9]*[a-z0-9])?))*$
                     type: string
                 type: object
               resources:
@@ -170,7 +171,8 @@ spec:
             type: object
             x-kubernetes-validations:
             - message: network.host is required when network.enabled is true
-              rule: '!self.network.enabled || self.network.host != ”'
+              rule: '!has(self.network) || !has(self.network.enabled) || self.network.enabled
+                == false || (has(self.network.host) && size(self.network.host) > 0)'
           status:
             description: Status defines the observed environment state.
             properties:

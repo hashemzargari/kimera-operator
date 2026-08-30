@@ -4,18 +4,17 @@ metadata:
   labels:
     app.kubernetes.io/name: kimera-operator
     app.kubernetes.io/managed-by: kustomize
-  name: team-a
+  name: demo
 spec:
-  image: ghcr.io/example/code-server:v0
+  image: codercom/code-server:latest
   resources:
-    cpuRequest: 500m
-    cpuLimit: "2"
-    memoryRequest: 1Gi
-    memoryLimit: 4Gi
+    cpuRequest: 250m
+    cpuLimit: "1"
+    memoryRequest: 512Mi
+    memoryLimit: 1Gi
   storage:
-    size: 10Gi
-    storageClassName: local-path
+    size: 2Gi
     retentionPolicy: Retain
   network:
     enabled: true
-    host: team-a.kimera.local
+    host: demo.kimera.local

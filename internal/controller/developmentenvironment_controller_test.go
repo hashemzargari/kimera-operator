@@ -24,6 +24,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/resource"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
@@ -94,3 +95,48 @@ var _ = Describe("DevelopmentEnvironment Controller", func() {
 		})
 	})
 })
+
+var _ = Describe("DevelopmentEnvironment API validation", func() {
+	It("validates optional network fields without evaluating absent fields", func() {
+		tests := []struct {
+			name    string
+			network map[string]any
+			valid   bool
+		}{
+			{name: "network-omitted", valid: true},
+			{name: "empty-network", network: map[string]any{}, valid: true},
+			{name: "network-disabled", network: map[string]any{"enabled": false}, valid: true},
+			{name: "enabled-without-host", network: map[string]any{"enabled": true}, valid: false},
+			{name: "enabled-with-empty-host", network: map[string]any{"enabled": true, "host": ""}, valid: false},
+			{name: "enabled-with-host", network: map[string]any{"enabled": true, "host": "demo.kimera.local"}, valid: true},
+		}
+
+		for _, test := range tests {
+			object := validationObject(test.name, test.network)
+			err := k8sClient.Create(ctx, object)
+			if test.valid {
+				Expect(err).NotTo(HaveOccurred(), test.name)
+				Expect(k8sClient.Delete(ctx, object)).To(Succeed())
+			} else {
+				Expect(errors.IsInvalid(err)).To(BeTrue(), test.name)
+			}
+		}
+	})
+})
+
+func validationObject(name string, network map[string]any) *unstructured.Unstructured {
+	spec := map[string]any{
+		"image":     "codercom/code-server:latest",
+		"resources": map[string]any{"cpuRequest": "250m", "cpuLimit": "1", "memoryRequest": "512Mi", "memoryLimit": "1Gi"},
+		"storage":   map[string]any{"size": "2Gi"},
+	}
+	if network != nil {
+		spec["network"] = network
+	}
+	return &unstructured.Unstructured{Object: map[string]any{
+		"apiVersion": "platform.kimera.dev/v1alpha1",
+		"kind":       "DevelopmentEnvironment",
+		"metadata":   map[string]any{"name": name, "namespace": "default"},
+		"spec":       spec,
+	}}
+}
