@@ -51,8 +51,9 @@ func (r *DevelopmentEnvironmentReconciler) Reconcile(ctx context.Context, req ct
 		return r.reconcileDelete(ctx, env)
 	}
 	if !controllerutil.ContainsFinalizer(env, finalizer) {
+		before := env.DeepCopy()
 		controllerutil.AddFinalizer(env, finalizer)
-		return ctrl.Result{}, r.Update(ctx, env)
+		return ctrl.Result{}, r.patchParent(ctx, env, before, "add finalizer")
 	}
 
 	before := env.DeepCopy()
@@ -83,7 +84,8 @@ func (r *DevelopmentEnvironmentReconciler) Reconcile(ctx context.Context, req ct
 		return ctrl.Result{}, fmt.Errorf("delete disabled Ingress: %w", err)
 	}
 
-	if err := r.setReadiness(ctx, env, before.Status.Phase == platformv1alpha1.PhaseReady, refsReady, refsMessage); err != nil {
+	wasReady := before.Status.Phase == platformv1alpha1.PhaseReady || before.Status.Phase == platformv1alpha1.PhaseDegraded
+	if err := r.setReadiness(ctx, env, wasReady, refsReady, refsMessage); err != nil {
 		return ctrl.Result{}, err
 	}
 	return ctrl.Result{}, r.writeStatus(ctx, before, env)
@@ -143,30 +145,27 @@ func (r *DevelopmentEnvironmentReconciler) reconcilePVC(ctx context.Context, env
 	if err != nil {
 		return fmt.Errorf("get PVC: %w", err)
 	}
+	current := existing.Spec.Resources.Requests[corev1.ResourceStorage]
+	if env.Spec.Storage.Size.Cmp(current) < 0 {
+		return &specError{fmt.Sprintf("requested storage %s is smaller than existing PVC size %s; shrinking is unsupported", env.Spec.Storage.Size.String(), current.String())}
+	}
+	before := existing.DeepCopy()
 	if !deletePVC(env) && metav1.IsControlledBy(existing, env) {
 		if err := controllerutil.RemoveControllerReference(env, existing, r.Scheme); err != nil {
 			return fmt.Errorf("remove PVC controller reference: %w", err)
-		}
-		if err := r.Update(ctx, existing); err != nil {
-			return fmt.Errorf("detach retained PVC: %w", err)
 		}
 	}
 	if deletePVC(env) && !metav1.IsControlledBy(existing, env) {
 		if err := controllerutil.SetControllerReference(env, existing, r.Scheme); err != nil {
 			return fmt.Errorf("set PVC controller reference: %w", err)
 		}
-		if err := r.Update(ctx, existing); err != nil {
-			return fmt.Errorf("update PVC controller reference: %w", err)
-		}
-	}
-	current := existing.Spec.Resources.Requests[corev1.ResourceStorage]
-	if env.Spec.Storage.Size.Cmp(current) < 0 {
-		return &specError{fmt.Sprintf("requested storage %s is smaller than existing PVC size %s; shrinking is unsupported", env.Spec.Storage.Size.String(), current.String())}
 	}
 	if env.Spec.Storage.Size.Cmp(current) > 0 {
 		existing.Spec.Resources.Requests[corev1.ResourceStorage] = env.Spec.Storage.Size
-		if err := r.Update(ctx, existing); err != nil {
-			return fmt.Errorf("expand PVC: %w", err)
+	}
+	if !equality.Semantic.DeepEqual(before.ObjectMeta.OwnerReferences, existing.ObjectMeta.OwnerReferences) || env.Spec.Storage.Size.Cmp(current) > 0 {
+		if err := r.Patch(ctx, existing, client.MergeFrom(before)); err != nil {
+			return fmt.Errorf("patch PVC: %w", err)
 		}
 	}
 	return nil
@@ -174,20 +173,34 @@ func (r *DevelopmentEnvironmentReconciler) reconcilePVC(ctx context.Context, env
 
 func (r *DevelopmentEnvironmentReconciler) reconcileOwned(ctx context.Context, env *platformv1alpha1.DevelopmentEnvironment, desired client.Object) error {
 	expected := desired.DeepCopyObject().(client.Object)
-	_, err := controllerutil.CreateOrUpdate(ctx, r.Client, desired, func() error {
-		desired.SetLabels(expected.GetLabels())
+	// Apply the same built-in Kubernetes defaults the API server applies. Without this,
+	// each reconcile can clear defaulted PodTemplate fields that the API server restores.
+	r.Scheme.Default(expected)
+	_, err := controllerutil.CreateOrPatch(ctx, r.Client, desired, func() error {
+		labels := desired.GetLabels()
+		if labels == nil {
+			labels = map[string]string{}
+		}
+		for key, value := range expected.GetLabels() {
+			labels[key] = value
+		}
+		desired.SetLabels(labels)
 		switch actual := desired.(type) {
 		case *appsv1.Deployment:
-			actual.Spec = expected.(*appsv1.Deployment).Spec
+			wanted := expected.(*appsv1.Deployment)
+			if !actual.CreationTimestamp.IsZero() && !equality.Semantic.DeepEqual(actual.Spec.Selector, wanted.Spec.Selector) {
+				return fmt.Errorf("managed Deployment selector differs from the immutable desired selector")
+			}
+			actual.Spec.Replicas = wanted.Spec.Replicas
+			actual.Spec.Selector = wanted.Spec.Selector
+			actual.Spec.Template = wanted.Spec.Template
 		case *corev1.Service:
-			old := actual.Spec
-			actual.Spec = expected.(*corev1.Service).Spec
-			// These values are allocated/defaulted by the API server and cannot safely be replaced.
-			actual.Spec.ClusterIP, actual.Spec.ClusterIPs = old.ClusterIP, old.ClusterIPs
-			actual.Spec.IPFamilies, actual.Spec.IPFamilyPolicy = old.IPFamilies, old.IPFamilyPolicy
-			actual.Spec.HealthCheckNodePort = old.HealthCheckNodePort
+			wanted := expected.(*corev1.Service)
+			actual.Spec.Type = wanted.Spec.Type
+			actual.Spec.Selector = wanted.Spec.Selector
+			actual.Spec.Ports = wanted.Spec.Ports
 		case *networkingv1.Ingress:
-			actual.Spec = expected.(*networkingv1.Ingress).Spec
+			actual.Spec.Rules = expected.(*networkingv1.Ingress).Spec.Rules
 		}
 		return controllerutil.SetControllerReference(env, desired, r.Scheme)
 	})
@@ -225,9 +238,21 @@ func (r *DevelopmentEnvironmentReconciler) setReadiness(ctx context.Context, env
 	} else {
 		env.Status.EnvironmentURL = ""
 	}
-	statusutil.Set(env, statusutil.StorageReady, condition(storageReady), "PVCObserved", "Workspace PVC is Bound")
-	statusutil.Set(env, statusutil.WorkloadReady, condition(workloadReady), "DeploymentObserved", "IDE Deployment availability was observed")
-	statusutil.Set(env, statusutil.NetworkReady, condition(networkReady), "IngressObserved", "Network configuration was observed")
+	storageMessage := "Workspace PVC is not Bound"
+	if storageReady {
+		storageMessage = "Workspace PVC is Bound"
+	}
+	workloadMessage := "IDE Deployment has no available replicas"
+	if workloadReady {
+		workloadMessage = "IDE Deployment has the desired available replicas"
+	}
+	networkMessage := "Managed Ingress has not been created"
+	if networkReady {
+		networkMessage = "Network configuration is ready"
+	}
+	statusutil.Set(env, statusutil.StorageReady, condition(storageReady), "PVCObserved", storageMessage)
+	statusutil.Set(env, statusutil.WorkloadReady, condition(workloadReady), "DeploymentObserved", workloadMessage)
+	statusutil.Set(env, statusutil.NetworkReady, condition(networkReady), "IngressObserved", networkMessage)
 	env.Status.ObservedGeneration = env.Generation
 	allReady := storageReady && workloadReady && serviceReady && networkReady && refsReady
 	if allReady {
@@ -262,7 +287,9 @@ func (r *DevelopmentEnvironmentReconciler) writeStatus(ctx context.Context, befo
 	if equality.Semantic.DeepEqual(before.Status, env.Status) {
 		return nil
 	}
-	if err := r.Status().Patch(ctx, env, client.MergeFrom(before)); err != nil {
+	if err := r.Status().Patch(ctx, env, client.MergeFrom(before)); apierrors.IsNotFound(err) {
+		return nil
+	} else if err != nil {
 		return fmt.Errorf("update status: %w", err)
 	}
 	return nil
@@ -282,10 +309,13 @@ func (r *DevelopmentEnvironmentReconciler) reconcileDelete(ctx context.Context, 
 		if err := r.Get(ctx, client.ObjectKeyFromObject(pvc), existing); err != nil && !apierrors.IsNotFound(err) {
 			return ctrl.Result{}, err
 		} else if err == nil && metav1.IsControlledBy(existing, env) {
+			before := existing.DeepCopy()
 			if err := controllerutil.RemoveControllerReference(env, existing, r.Scheme); err != nil {
 				return ctrl.Result{}, err
 			}
-			if err := r.Update(ctx, existing); err != nil {
+			if err := r.Patch(ctx, existing, client.MergeFrom(before)); apierrors.IsNotFound(err) {
+				// The claim disappeared concurrently, so there is nothing left to retain.
+			} else if err != nil {
 				return ctrl.Result{}, err
 			}
 		}
@@ -303,11 +333,14 @@ func (r *DevelopmentEnvironmentReconciler) reconcileDelete(ctx context.Context, 
 			return ctrl.Result{Requeue: true}, nil
 		}
 	}
+	before := env.DeepCopy()
 	controllerutil.RemoveFinalizer(env, finalizer)
-	return ctrl.Result{}, r.Update(ctx, env)
+	return ctrl.Result{}, r.patchParent(ctx, env, before, "remove finalizer")
 }
 func (r *DevelopmentEnvironmentReconciler) deleteAndConfirm(ctx context.Context, object client.Object) (bool, error) {
-	if err := r.Delete(ctx, object); client.IgnoreNotFound(err) != nil {
+	if err := r.Delete(ctx, object); apierrors.IsNotFound(err) {
+		return true, nil
+	} else if err != nil {
 		return false, fmt.Errorf("delete %T: %w", object, err)
 	}
 	err := r.Get(ctx, client.ObjectKeyFromObject(object), object)
@@ -318,6 +351,17 @@ func (r *DevelopmentEnvironmentReconciler) deleteAndConfirm(ctx context.Context,
 		return false, fmt.Errorf("confirm deletion of %T: %w", object, err)
 	}
 	return false, nil
+}
+
+// patchParent updates parent metadata without rewriting a concurrently edited spec. Once the
+// parent has disappeared, finalizer/status work is complete and NotFound is terminal.
+func (r *DevelopmentEnvironmentReconciler) patchParent(ctx context.Context, env, before *platformv1alpha1.DevelopmentEnvironment, operation string) error {
+	if err := r.Patch(ctx, env, client.MergeFrom(before)); apierrors.IsNotFound(err) {
+		return nil
+	} else if err != nil {
+		return fmt.Errorf("%s: %w", operation, err)
+	}
+	return nil
 }
 
 // SetupWithManager watches owned children so their deletion or drift enqueues the parent and is repaired.
