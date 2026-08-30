@@ -1,0 +1,32 @@
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: manager-role
+rules:
+- apiGroups:
+  - platform.kimera.dev
+  resources:
+  - developmentenvironments
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+  - patch
+  - update
+  - watch
+- apiGroups:
+  - platform.kimera.dev
+  resources:
+  - developmentenvironments/finalizers
+  verbs:
+  - update
+- apiGroups:
+  - platform.kimera.dev
+  resources:
+  - developmentenvironments/status
+  verbs:
+  - get
+  - patch
+  - update
