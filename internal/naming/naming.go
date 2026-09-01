@@ -51,6 +51,10 @@ func PVC(env *platformv1alpha1.DevelopmentEnvironment) string {
 func Deployment(env *platformv1alpha1.DevelopmentEnvironment) string { return env.Name }
 func Service(env *platformv1alpha1.DevelopmentEnvironment) string    { return env.Name }
 func Ingress(env *platformv1alpha1.DevelopmentEnvironment) string    { return env.Name }
+func ServiceAccount(env *platformv1alpha1.DevelopmentEnvironment) string {
+	return env.Name
+}
+func NetworkPolicy(env *platformv1alpha1.DevelopmentEnvironment) string { return env.Name }
 
 // SelectorLabels uniquely identify workloads belonging to one environment instance.
 // An environment without an API-assigned UID deliberately has no usable selector.

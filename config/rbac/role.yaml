@@ -8,6 +8,7 @@ rules:
   - ""
   resources:
   - configmaps
+  - pods
   - secrets
   verbs:
   - get
@@ -16,7 +17,15 @@ rules:
 - apiGroups:
   - ""
   resources:
+  - events
+  verbs:
+  - create
+  - patch
+- apiGroups:
+  - ""
+  resources:
   - persistentvolumeclaims
+  - serviceaccounts
   - services
   verbs:
   - create
@@ -42,6 +51,7 @@ rules:
   - networking.k8s.io
   resources:
   - ingresses
+  - networkpolicies
   verbs:
   - create
   - delete

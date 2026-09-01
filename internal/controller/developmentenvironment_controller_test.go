@@ -18,6 +18,7 @@ package controller
 
 import (
 	"context"
+	"fmt"
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
@@ -37,7 +38,14 @@ import (
 	"github.com/hashemzargari/kimera-operator/internal/naming"
 )
 
-const networkEnabledFieldKey = "enabled"
+const (
+	networkEnabledFieldKey = "enabled"
+	gitFieldKey            = "git"
+	urlFieldKey            = "url"
+	sourceFieldKey         = "source"
+	revisionFieldKey       = "revision"
+	subPathFieldKey        = "subPath"
+)
 
 var _ = Describe("DevelopmentEnvironment Controller", func() {
 	Context("When reconciling a resource", func() {
@@ -102,6 +110,8 @@ var _ = Describe("DevelopmentEnvironment Controller", func() {
 			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: naming.PVC(current), Namespace: resourceNamespace}, &corev1.PersistentVolumeClaim{})).To(Succeed())
 			Expect(k8sClient.Get(ctx, typeNamespacedName, &corev1.Service{})).To(Succeed())
 			Expect(k8sClient.Get(ctx, typeNamespacedName, &networkingv1.Ingress{})).To(Succeed())
+			Expect(k8sClient.Get(ctx, typeNamespacedName, &corev1.ServiceAccount{})).To(Succeed())
+			Expect(k8sClient.Get(ctx, typeNamespacedName, &networkingv1.NetworkPolicy{})).To(Succeed())
 
 			recorder := &stablePatchCountingClient{Client: k8sClient}
 			controllerReconciler.Client = recorder
@@ -110,6 +120,8 @@ var _ = Describe("DevelopmentEnvironment Controller", func() {
 			Expect(recorder.deploymentPatches).To(Equal(0))
 			Expect(recorder.servicePatches).To(Equal(0))
 			Expect(recorder.ingressPatches).To(Equal(0))
+			Expect(recorder.serviceAccountPatches).To(Equal(0))
+			Expect(recorder.networkPolicyPatches).To(Equal(0))
 		})
 	})
 })
@@ -140,11 +152,95 @@ var _ = Describe("DevelopmentEnvironment API validation", func() {
 			}
 		}
 	})
+
+	It("defaults Phase 2 fields and validates Git source shape", func() {
+		valid := validationObject("phase2-defaults", nil)
+		valid.Object["spec"].(map[string]any)[sourceFieldKey] = map[string]any{gitFieldKey: map[string]any{urlFieldKey: "https://github.com/example/repository.git"}}
+		Expect(k8sClient.Create(ctx, valid)).To(Succeed())
+		created := &unstructured.Unstructured{}
+		created.SetAPIVersion(valid.GetAPIVersion())
+		created.SetKind(valid.GetKind())
+		Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(valid), created)).To(Succeed())
+		suspended, found, err := unstructured.NestedBool(created.Object, "spec", "suspended")
+		Expect(err).NotTo(HaveOccurred())
+		Expect(found).To(BeTrue())
+		Expect(suspended).To(BeFalse())
+		revision, found, err := unstructured.NestedString(created.Object, "spec", sourceFieldKey, gitFieldKey, revisionFieldKey)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(found).To(BeTrue())
+		Expect(revision).To(Equal("main"))
+		Expect(k8sClient.Delete(ctx, valid)).To(Succeed())
+
+		for _, source := range []map[string]any{
+			{},
+			{gitFieldKey: map[string]any{urlFieldKey: "http://example.com/repository.git"}},
+			{gitFieldKey: map[string]any{urlFieldKey: "https://github.com/example/repository.git", "revision": "-unsafe"}},
+		} {
+			invalid := validationObject("invalid-source-"+fmt.Sprint(len(source)), nil)
+			invalid.Object["metadata"].(map[string]any)["generateName"] = invalid.GetName() + "-"
+			delete(invalid.Object["metadata"].(map[string]any), "name")
+			invalid.Object["spec"].(map[string]any)[sourceFieldKey] = source
+			Expect(errors.IsInvalid(k8sClient.Create(ctx, invalid))).To(BeTrue())
+		}
+	})
+
+	It("keeps source immutable while allowing unrelated spec updates", func() {
+		withoutSource := validationObject("source-immutable-absent", nil)
+		Expect(k8sClient.Create(ctx, withoutSource)).To(Succeed())
+		current := &unstructured.Unstructured{}
+		current.SetAPIVersion(withoutSource.GetAPIVersion())
+		current.SetKind(withoutSource.GetKind())
+		Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(withoutSource), current)).To(Succeed())
+		current.Object["spec"].(map[string]any)[sourceFieldKey] = gitSource("https://github.com/example/added.git", "main", "")
+		Expect(errors.IsInvalid(k8sClient.Update(ctx, current))).To(BeTrue())
+		Expect(k8sClient.Delete(ctx, withoutSource)).To(Succeed())
+
+		withSource := validationObject("source-immutable-present", nil)
+		withSource.Object["spec"].(map[string]any)[sourceFieldKey] = gitSource("https://github.com/example/original.git", "main", "src")
+		Expect(k8sClient.Create(ctx, withSource)).To(Succeed())
+
+		mutations := []struct {
+			name   string
+			mutate func(map[string]any)
+		}{
+			{name: "url", mutate: func(git map[string]any) { git[urlFieldKey] = "https://github.com/example/changed.git" }},
+			{name: revisionFieldKey, mutate: func(git map[string]any) { git[revisionFieldKey] = "develop" }},
+			{name: subPathFieldKey, mutate: func(git map[string]any) { git[subPathFieldKey] = "cmd" }},
+			{name: "removal", mutate: nil},
+		}
+		for _, mutation := range mutations {
+			By("rejecting source " + mutation.name)
+			candidate := &unstructured.Unstructured{}
+			candidate.SetAPIVersion(withSource.GetAPIVersion())
+			candidate.SetKind(withSource.GetKind())
+			Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(withSource), candidate)).To(Succeed())
+			spec := candidate.Object["spec"].(map[string]any)
+			if mutation.mutate == nil {
+				delete(spec, sourceFieldKey)
+			} else {
+				git := spec[sourceFieldKey].(map[string]any)[gitFieldKey].(map[string]any)
+				mutation.mutate(git)
+			}
+			Expect(errors.IsInvalid(k8sClient.Update(ctx, candidate))).To(BeTrue())
+		}
+
+		Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(withSource), current)).To(Succeed())
+		current.Object["spec"].(map[string]any)["resources"].(map[string]any)["cpuRequest"] = "300m"
+		Expect(k8sClient.Update(ctx, current)).To(Succeed())
+		Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(withSource), current)).To(Succeed())
+		current.Object["spec"].(map[string]any)["suspended"] = true
+		Expect(k8sClient.Update(ctx, current)).To(Succeed())
+		Expect(k8sClient.Delete(ctx, current)).To(Succeed())
+	})
 })
+
+func gitSource(repositoryURL, revision, subPath string) map[string]any {
+	return map[string]any{gitFieldKey: map[string]any{urlFieldKey: repositoryURL, revisionFieldKey: revision, subPathFieldKey: subPath}}
+}
 
 func validationObject(name string, network map[string]any) *unstructured.Unstructured {
 	spec := map[string]any{
-		"image":     "codercom/code-server:latest",
+		"image":     testIDEImage,
 		"resources": map[string]any{"cpuRequest": "250m", "cpuLimit": "1", "memoryRequest": "512Mi", "memoryLimit": "1Gi"},
 		"storage":   map[string]any{"size": "2Gi"},
 	}
@@ -161,9 +257,11 @@ func validationObject(name string, network map[string]any) *unstructured.Unstruc
 
 type stablePatchCountingClient struct {
 	client.Client
-	deploymentPatches int
-	servicePatches    int
-	ingressPatches    int
+	deploymentPatches     int
+	servicePatches        int
+	ingressPatches        int
+	serviceAccountPatches int
+	networkPolicyPatches  int
 }
 
 func (c *stablePatchCountingClient) Patch(ctx context.Context, object client.Object, patch client.Patch, options ...client.PatchOption) error {
@@ -174,6 +272,10 @@ func (c *stablePatchCountingClient) Patch(ctx context.Context, object client.Obj
 		c.servicePatches++
 	case *networkingv1.Ingress:
 		c.ingressPatches++
+	case *corev1.ServiceAccount:
+		c.serviceAccountPatches++
+	case *networkingv1.NetworkPolicy:
+		c.networkPolicyPatches++
 	}
 	return c.Client.Patch(ctx, object, patch, options...)
 }

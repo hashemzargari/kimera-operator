@@ -1,11 +1,16 @@
 # KIMERA Operator
 
-KIMERA Operator Phase 1 manages a `DevelopmentEnvironment`: one persistent
-workspace PVC, one IDE Deployment, a ClusterIP Service, and an optional Ingress.
-It intentionally does not manage source control, authentication, or shared tenancy.
-The sample uses `codercom/code-server:latest` with code-server authentication disabled for a
-local learning demo. Production deployments should pin an explicit image version or digest and
-use an appropriate authentication approach.
+KIMERA Phase 2 manages a persistent browser IDE as a Kubernetes
+`DevelopmentEnvironment`. Each resource receives a UID-scoped Deployment and Pod selector, a
+UID-derived workspace PVC, a ClusterIP Service, an optional Ingress, an unprivileged
+ServiceAccount, and a NetworkPolicy. It can initialize a new workspace from a public HTTPS Git
+repository and suspend compute without replacing storage or network objects.
+
+This is a production-minded learning milestone, not a complete public multi-tenant platform.
+The IDE still runs code-server with `--auth none`; enable Ingress only on a trusted local/demo
+network until an authentication gateway exists. The CR also accepts an arbitrary image, so a
+real platform needs an image admission policy. See [Phase 2 architecture](docs/phase2-architecture.md)
+for the security and namespace boundaries.
 
 ## Requirements
 
@@ -26,23 +31,27 @@ Inspect the environment with:
 
 ```sh
 kubectl get developmentenvironments
-kubectl get deployment,pods,pvc,svc,ingress
+kubectl get deployment,pods,pvc,svc,ingress,serviceaccount,networkpolicy
 kubectl get developmentenvironment demo -o yaml
 ```
 
-## Demo
+## Phase 2 behavior
 
-1. Start a local cluster with a default StorageClass, then run the workflow above. If your
-   cluster has no default StorageClass, specify one under `spec.storage.storageClassName`.
-2. Wait until `kubectl get developmentenvironment demo` reports `Ready`, then inspect the
-   generated Deployment, Service, PVC, and Ingress.
-3. Point `demo.kimera.local` at the local ingress address (for many local clusters this is
-   `127.0.0.1`; add `127.0.0.1 demo.kimera.local` to your hosts file) and open
-   `http://demo.kimera.local`.
-4. Delete `kubectl delete deployment demo`; the owned-resource watch makes the operator recreate it.
-5. Edit the sample CR's CPU request or image and apply it again; observe the Deployment roll out.
-6. Delete the CR with `retentionPolicy: Retain` and verify its UID-derived workspace PVC remains.
-7. Reapply it with `retentionPolicy: Delete`, then delete the CR and verify the PVC is removed.
+- `spec.suspended: false` means one IDE replica. `true` patches that same Deployment to zero;
+  the PVC, Service, Ingress, ServiceAccount, selectors, and CR identity remain unchanged.
+- `spec.source.git` performs one non-destructive clone on the first Pod start. The persistent
+  `.kimera-initialized` marker prevents cloning or pulling on restarts and resume. Existing
+  workspace contents are never overwritten. Source is immutable after CR creation.
+- The IDE uses a dedicated ServiceAccount with token automount disabled and receives no RBAC.
+- The NetworkPolicy selects the exact CR UID. It permits IDE HTTP ingress from the environment
+  namespace and `kube-system`, DNS to `kube-system`, and outbound HTTPS. Enforcement requires a
+  NetworkPolicy-capable CNI.
+- Namespace is the current security/tenancy boundary. Multiple environments in one namespace
+  are in the same trust domain. ResourceQuota and LimitRange are deliberately not synthesized
+  per environment because Kubernetes applies both to an entire namespace.
+
+The complete persistence, suspend/resume, self-healing, security-object, UID-isolation, and
+retention demonstration is in [the Phase 2 k3d demo](docs/phase2-demo.md).
 
 Storage expansion is passed to Kubernetes only for a Bound PVC whose actual StorageClass
 explicitly enables expansion. Unsupported expansion is reported as `Degraded` with
@@ -69,5 +78,5 @@ kubectl get pvc -l platform.kimera.dev/managed-by=kimera --show-labels
 
 Explicit restoration is future control-plane work. A restore flow must intentionally reference
 the retained storage identity and verify KIMERA provenance, compatibility, attachment state, and
-the authenticated caller's authorization. Phase 1 does not infer business ownership from a
+the authenticated caller's authorization. Phase 2 does not infer business ownership from a
 Kubernetes resource name and never adopts retained storage implicitly.

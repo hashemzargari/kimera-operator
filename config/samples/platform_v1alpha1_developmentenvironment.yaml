@@ -6,7 +6,8 @@ metadata:
     app.kubernetes.io/managed-by: kustomize
   name: demo
 spec:
-  image: codercom/code-server:latest
+  suspended: false
+  image: ghcr.io/coder/code-server:4.104.2
   resources:
     cpuRequest: 250m
     cpuLimit: "1"
@@ -15,6 +16,10 @@ spec:
   storage:
     size: 2Gi
     retentionPolicy: Retain
+  source:
+    git:
+      url: https://github.com/octocat/Hello-World.git
+      revision: master
   network:
     enabled: true
     host: demo.kimera.local

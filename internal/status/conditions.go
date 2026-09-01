@@ -12,6 +12,8 @@ const (
 	StorageReady  = "StorageReady"
 	WorkloadReady = "WorkloadReady"
 	NetworkReady  = "NetworkReady"
+	SourceReady   = "SourceReady"
+	Suspended     = "Suspended"
 	Progressing   = "Progressing"
 )
 

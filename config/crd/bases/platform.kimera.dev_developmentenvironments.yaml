@@ -14,7 +14,17 @@ spec:
     singular: developmentenvironment
   scope: Namespaced
   versions:
-  - name: v1alpha1
+  - additionalPrinterColumns:
+    - jsonPath: .status.phase
+      name: Phase
+      type: string
+    - jsonPath: .spec.suspended
+      name: Suspended
+      type: boolean
+    - jsonPath: .status.environmentURL
+      name: URL
+      type: string
+    name: v1alpha1
     schema:
       openAPIV3Schema:
         description: DevelopmentEnvironment is the Schema for a managed, persistent
@@ -137,6 +147,42 @@ spec:
                 x-kubernetes-list-map-keys:
                 - name
                 x-kubernetes-list-type: map
+              source:
+                description: Source configures optional creation-time, one-time workspace
+                  initialization and is immutable for the lifetime of the DevelopmentEnvironment.
+                properties:
+                  git:
+                    description: Git initializes the workspace from a public HTTPS
+                      repository on the first Pod start.
+                    properties:
+                      revision:
+                        default: main
+                        description: Revision is a branch, tag, or commit resolved
+                          during first initialization.
+                        maxLength: 255
+                        minLength: 1
+                        pattern: ^[A-Za-z0-9][A-Za-z0-9._/-]*$
+                        type: string
+                      subPath:
+                        description: SubPath copies only this relative repository
+                          directory into the workspace.
+                        maxLength: 1024
+                        pattern: ^$|^[A-Za-z0-9][A-Za-z0-9._/-]*$
+                        type: string
+                      url:
+                        description: URL is the public HTTPS repository URL. URLs
+                          containing credentials are rejected.
+                        maxLength: 2048
+                        minLength: 1
+                        pattern: ^https://[^[:space:]]+$
+                        type: string
+                    required:
+                    - url
+                    type: object
+                type: object
+                x-kubernetes-validations:
+                - message: source.git is required when source is configured
+                  rule: has(self.git)
               storage:
                 description: Storage configures the environment's persistent workspace.
                 properties:
@@ -164,6 +210,11 @@ spec:
                 required:
                 - size
                 type: object
+              suspended:
+                default: false
+                description: Suspended intentionally scales compute to zero while
+                  retaining all persistent and network objects.
+                type: boolean
             required:
             - image
             - resources
@@ -173,12 +224,15 @@ spec:
             - message: network.host is required when network.enabled is true
               rule: '!has(self.network) || !has(self.network.enabled) || self.network.enabled
                 == false || (has(self.network.host) && size(self.network.host) > 0)'
+            - message: source is immutable after creation
+              rule: '!has(oldSelf.source) ? !has(self.source) : has(self.source) &&
+                self.source == oldSelf.source'
           status:
             description: Status defines the observed environment state.
             properties:
               conditions:
-                description: Conditions describe readiness of storage, workload, network,
-                  and overall progress.
+                description: Conditions describe storage, workload, network, source,
+                  suspension, and overall progress.
                 items:
                   description: Condition contains details for one aspect of the current
                     state of this API Resource.
@@ -238,8 +292,8 @@ spec:
                 - type
                 x-kubernetes-list-type: map
               environmentURL:
-                description: EnvironmentURL is the HTTPS URL served by the managed
-                  Ingress, when enabled.
+                description: EnvironmentURL is the URL served by the managed Ingress,
+                  when enabled.
                 type: string
               observedGeneration:
                 description: ObservedGeneration is the most recent generation processed
@@ -249,6 +303,13 @@ spec:
               phase:
                 description: Phase is the high-level lifecycle state reported by the
                   controller.
+                enum:
+                - Pending
+                - Provisioning
+                - Ready
+                - Suspended
+                - Degraded
+                - Failed
                 type: string
             type: object
         required:
