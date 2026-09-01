@@ -1,6 +1,8 @@
 package resources
 
 import (
+	"fmt"
+
 	platformv1alpha1 "github.com/hashemzargari/kimera-operator/api/v1alpha1"
 	"github.com/hashemzargari/kimera-operator/internal/naming"
 	appsv1 "k8s.io/api/apps/v1"
@@ -114,7 +116,7 @@ func ideContainer(env *platformv1alpha1.DevelopmentEnvironment, noEscalation, ru
 		Name:            "ide",
 		Image:           env.Spec.Image,
 		ImagePullPolicy: corev1.PullIfNotPresent,
-		Args:            []string{"--bind-addr", "0.0.0.0:8080", "--auth", "none"},
+		Args:            []string{"--bind-addr", fmt.Sprintf("0.0.0.0:%d", IDEPort), "--auth", "none"},
 		Ports:           []corev1.ContainerPort{{Name: "http", ContainerPort: IDEPort, Protocol: corev1.ProtocolTCP}},
 		EnvFrom:         envFrom,
 		Resources: corev1.ResourceRequirements{
