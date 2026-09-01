@@ -16,10 +16,10 @@ spec:
   storage:
     size: 2Gi
     retentionPolicy: Retain
-#  source:
-#    git:
-#      url: https://github.com/octocat/Hello-World.git
-#      revision: master
+  source:
+    git:
+      url: https://github.com/octocat/Hello-World.git
+      revision: master
   network:
     enabled: true
     host: demo.kimera.local
