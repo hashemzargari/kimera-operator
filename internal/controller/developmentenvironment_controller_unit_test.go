@@ -3,6 +3,8 @@ package controller
 import (
 	"context"
 	"errors"
+	"reflect"
+	"strings"
 	"testing"
 
 	appsv1 "k8s.io/api/apps/v1"
@@ -20,6 +22,7 @@ import (
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 
 	platformv1alpha1 "github.com/hashemzargari/kimera-operator/api/v1alpha1"
 	"github.com/hashemzargari/kimera-operator/internal/naming"
@@ -180,6 +183,7 @@ func TestOwnedChildDriftIsCorrectedOnceThenConverges(t *testing.T) {
 		t.Fatal(err)
 	}
 	service.Spec.Ports[0].Port = 81
+	service.Spec.Selector[naming.EnvironmentUIDLabel] = "wrong-uid"
 	if err := base.Update(context.Background(), service); err != nil {
 		t.Fatal(err)
 	}
@@ -188,6 +192,9 @@ func TestOwnedChildDriftIsCorrectedOnceThenConverges(t *testing.T) {
 		t.Fatal(err)
 	}
 	ingress.Spec.Rules[0].Host = "drifted.example.com"
+	ingressClassName := "externally-configured-class"
+	ingress.Spec.IngressClassName = &ingressClassName
+	ingress.Annotations = map[string]string{"external.example/kept": "true"}
 	if err := base.Update(context.Background(), ingress); err != nil {
 		t.Fatal(err)
 	}
@@ -212,12 +219,16 @@ func TestOwnedChildDriftIsCorrectedOnceThenConverges(t *testing.T) {
 	if service.Spec.Ports[0].Port != 80 {
 		t.Fatalf("Service port = %d, want 80", service.Spec.Ports[0].Port)
 	}
+	if !reflect.DeepEqual(service.Spec.Selector, naming.SelectorLabels(env)) {
+		t.Fatalf("Service selector = %#v, want %#v", service.Spec.Selector, naming.SelectorLabels(env))
+	}
 	if err := base.Get(context.Background(), key, ingress); err != nil {
 		t.Fatal(err)
 	}
 	if ingress.Spec.Rules[0].Host != env.Spec.Network.Host {
 		t.Fatalf("Ingress host = %q, want %q", ingress.Spec.Rules[0].Host, env.Spec.Network.Host)
 	}
+	assertIngressPreservedAndRouted(t, ingress, env, ingressClassName)
 	tracker.deploymentPatches, tracker.servicePatches, tracker.ingressPatches = 0, 0, 0
 	if _, err := reconciler.Reconcile(context.Background(), request(env.Name)); err != nil {
 		t.Fatal(err)
@@ -258,6 +269,9 @@ func TestDeploymentDeletionRecreatesAndReadinessRecovers(t *testing.T) {
 	if err := base.Get(context.Background(), client.ObjectKeyFromObject(env), deployment); err != nil {
 		t.Fatalf("Deployment was not recreated: %v", err)
 	}
+	if !reflect.DeepEqual(deployment.Spec.Selector.MatchLabels, naming.SelectorLabels(env)) {
+		t.Fatalf("recreated Deployment selector = %#v, want %#v", deployment.Spec.Selector.MatchLabels, naming.SelectorLabels(env))
+	}
 	assertPhase(t, base, env.Name, platformv1alpha1.PhaseDegraded)
 	deployment.Status.AvailableReplicas = 1
 	if err := base.Status().Update(context.Background(), deployment); err != nil {
@@ -267,6 +281,115 @@ func TestDeploymentDeletionRecreatesAndReadinessRecovers(t *testing.T) {
 		t.Fatal(err)
 	}
 	assertPhase(t, base, env.Name, platformv1alpha1.PhaseReady)
+}
+
+func TestControlledDeploymentWithDifferentSelectorIsRecreatedAndPreservesPVC(t *testing.T) {
+	reconciler, base := unitReconciler(t)
+	env := unitEnvironment("selector-replacement")
+	env.Finalizers = []string{finalizer}
+	if err := base.Create(context.Background(), env); err != nil {
+		t.Fatal(err)
+	}
+	existingPVC := resources.DesiredPVC(env)
+	existingPVC.UID = types.UID("existing-workspace-pvc")
+	if err := base.Create(context.Background(), existingPVC); err != nil {
+		t.Fatal(err)
+	}
+	differentSelector := map[string]string{"external.example/workload": "previous-state"}
+	deploymentWithDifferentSelector := resources.DesiredDeployment(env)
+	deploymentWithDifferentSelector.Spec.Selector = &metav1.LabelSelector{MatchLabels: differentSelector}
+	deploymentWithDifferentSelector.Spec.Template.Labels = differentSelector
+	if err := controllerutil.SetControllerReference(env, deploymentWithDifferentSelector, reconciler.Scheme); err != nil {
+		t.Fatal(err)
+	}
+	if err := base.Create(context.Background(), deploymentWithDifferentSelector); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := reconciler.Reconcile(context.Background(), request(env.Name)); err != nil {
+		t.Fatal(err)
+	}
+	deployment := &appsv1.Deployment{}
+	if err := base.Get(context.Background(), client.ObjectKeyFromObject(env), deployment); err != nil {
+		t.Fatal(err)
+	}
+	wantSelector := &metav1.LabelSelector{MatchLabels: naming.SelectorLabels(env)}
+	if !equality.Semantic.DeepEqual(deployment.Spec.Selector, wantSelector) {
+		t.Fatalf("recreated selector = %#v, want %#v", deployment.Spec.Selector, wantSelector)
+	}
+	if !metav1.IsControlledBy(deployment, env) {
+		t.Fatal("recreated Deployment is not controlled by the current environment")
+	}
+	pvc := &corev1.PersistentVolumeClaim{}
+	pvcKey := client.ObjectKey{Namespace: env.Namespace, Name: naming.PVC(env)}
+	if err := base.Get(context.Background(), pvcKey, pvc); err != nil {
+		t.Fatalf("UID-derived PVC was not preserved: %v", err)
+	}
+	if pvc.UID != existingPVC.UID {
+		t.Fatalf("PVC UID after Deployment replacement = %q, want original %q", pvc.UID, existingPVC.UID)
+	}
+	claims := &corev1.PersistentVolumeClaimList{}
+	if err := base.List(context.Background(), claims, client.InNamespace(env.Namespace)); err != nil {
+		t.Fatal(err)
+	}
+	if len(claims.Items) != 1 || claims.Items[0].Name != pvcKey.Name {
+		t.Fatalf("PVCs after Deployment replacement = %#v, want only %q", claims.Items, pvcKey.Name)
+	}
+}
+
+func TestUnrelatedSameNameDeploymentIsNotAdoptedOrReplaced(t *testing.T) {
+	reconciler, base := unitReconciler(t)
+	env := unitEnvironment("deployment-collision")
+	env.Finalizers = []string{finalizer}
+	if err := base.Create(context.Background(), env); err != nil {
+		t.Fatal(err)
+	}
+	unrelated := resources.DesiredDeployment(env)
+	unrelated.Labels = map[string]string{"external.example/owner": "someone-else"}
+	unrelatedSelector := map[string]string{"external.example/workload": "unrelated"}
+	unrelated.Spec.Selector = &metav1.LabelSelector{MatchLabels: unrelatedSelector}
+	unrelated.Spec.Template.Labels = unrelatedSelector
+	if err := base.Create(context.Background(), unrelated); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := reconciler.Reconcile(context.Background(), request(env.Name)); err == nil || !strings.Contains(err.Error(), "refusing adoption or replacement") {
+		t.Fatalf("expected safe Deployment collision error, got %v", err)
+	}
+	after := &appsv1.Deployment{}
+	if err := base.Get(context.Background(), client.ObjectKeyFromObject(env), after); err != nil {
+		t.Fatal(err)
+	}
+	if len(after.OwnerReferences) != 0 || after.Labels["external.example/owner"] != "someone-else" || !reflect.DeepEqual(after.Spec.Selector, unrelated.Spec.Selector) {
+		t.Fatal("unrelated same-name Deployment was mutated or adopted")
+	}
+}
+
+func TestMissingEnvironmentUIDFailsBeforeCreatingChildren(t *testing.T) {
+	reconciler, base := unitReconciler(t)
+	env := unitEnvironment("missing-uid")
+	env.UID = ""
+	env.Finalizers = []string{finalizer}
+	if err := base.Create(context.Background(), env); err != nil {
+		t.Fatal(err)
+	}
+	if result, err := reconciler.Reconcile(context.Background(), request(env.Name)); err != nil || result.RequeueAfter > 0 {
+		t.Fatalf("missing UID should be a terminal lifecycle error: result=%+v err=%v", result, err)
+	}
+	assertPhase(t, base, env.Name, platformv1alpha1.PhaseFailed)
+	for _, object := range []client.Object{&appsv1.Deployment{}, &corev1.Service{}} {
+		list := object.DeepCopyObject().(client.Object)
+		if err := base.Get(context.Background(), client.ObjectKeyFromObject(env), list); !apierrors.IsNotFound(err) {
+			t.Fatalf("%T exists despite missing environment UID: %v", object, err)
+		}
+	}
+	claims := &corev1.PersistentVolumeClaimList{}
+	if err := base.List(context.Background(), claims, client.InNamespace(env.Namespace)); err != nil {
+		t.Fatal(err)
+	}
+	if len(claims.Items) != 0 {
+		t.Fatalf("PVCs exist despite missing environment UID: %#v", claims.Items)
+	}
 }
 
 func TestParentDisappearingDuringStatusPatchIsTerminal(t *testing.T) {
@@ -890,5 +1013,16 @@ func assertPhase(t *testing.T, base client.Client, name string, want platformv1a
 	}
 	if env.Status.Phase != want {
 		t.Fatalf("phase = %q, want %q", env.Status.Phase, want)
+	}
+}
+
+func assertIngressPreservedAndRouted(t *testing.T, ingress *networkingv1.Ingress, env *platformv1alpha1.DevelopmentEnvironment, ingressClassName string) {
+	t.Helper()
+	if ingress.Spec.IngressClassName == nil || *ingress.Spec.IngressClassName != ingressClassName || ingress.Annotations["external.example/kept"] != "true" {
+		t.Fatal("Ingress reconciliation did not preserve unrelated fields")
+	}
+	backend := ingress.Spec.Rules[0].HTTP.Paths[0].Backend.Service
+	if backend == nil || backend.Name != naming.Service(env) {
+		t.Fatalf("Ingress backend = %#v, want named Service %q", backend, naming.Service(env))
 	}
 }

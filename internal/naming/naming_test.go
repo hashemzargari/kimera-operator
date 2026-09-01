@@ -1,6 +1,7 @@
 package naming
 
 import (
+	"reflect"
 	"strings"
 	"testing"
 
@@ -10,8 +11,41 @@ import (
 	platformv1alpha1 "github.com/hashemzargari/kimera-operator/api/v1alpha1"
 )
 
+const testEnvironmentName = "demo"
+
+func TestSelectorLabelsIncludeImmutableEnvironmentIdentity(t *testing.T) {
+	envA := &platformv1alpha1.DevelopmentEnvironment{ObjectMeta: metav1.ObjectMeta{Name: testEnvironmentName, UID: types.UID("uid-a")}}
+	envB := envA.DeepCopy()
+	envB.UID = types.UID("uid-b")
+
+	wantA := map[string]string{NameLabel: testEnvironmentName, EnvironmentUIDLabel: "uid-a"}
+	if got := SelectorLabels(envA); !reflect.DeepEqual(got, wantA) {
+		t.Fatalf("selector labels = %#v, want %#v", got, wantA)
+	}
+	if reflect.DeepEqual(SelectorLabels(envA), SelectorLabels(envB)) {
+		t.Fatal("same-name environments with different UIDs must have different selectors")
+	}
+}
+
+func TestEnvironmentAndStorageIdentity(t *testing.T) {
+	env := &platformv1alpha1.DevelopmentEnvironment{ObjectMeta: metav1.ObjectMeta{UID: types.UID("uid-a")}}
+	if got, want := DevelopmentEnvironmentIdentity(env), string(env.UID); got != want {
+		t.Fatalf("DevelopmentEnvironment identity = %q, want %q", got, want)
+	}
+	if got, want := StorageIdentity(env), DevelopmentEnvironmentIdentity(env); got != want {
+		t.Fatalf("storage identity = %q, want environment identity %q", got, want)
+	}
+}
+
+func TestSelectorLabelsRejectMissingUID(t *testing.T) {
+	env := &platformv1alpha1.DevelopmentEnvironment{ObjectMeta: metav1.ObjectMeta{Name: testEnvironmentName}}
+	if got := SelectorLabels(env); got != nil {
+		t.Fatalf("selector labels without UID = %#v, want nil", got)
+	}
+}
+
 func TestPVCIdentityIsStablePerUIDAndIsolatedAcrossUIDs(t *testing.T) {
-	first := &platformv1alpha1.DevelopmentEnvironment{ObjectMeta: metav1.ObjectMeta{Name: "demo", UID: types.UID("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa")}}
+	first := &platformv1alpha1.DevelopmentEnvironment{ObjectMeta: metav1.ObjectMeta{Name: testEnvironmentName, UID: types.UID("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa")}}
 	second := first.DeepCopy()
 	second.UID = types.UID("bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb")
 

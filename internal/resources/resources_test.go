@@ -1,14 +1,18 @@
 package resources
 
 import (
+	"maps"
+	"reflect"
 	"testing"
 
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/types"
 
 	platformv1alpha1 "github.com/hashemzargari/kimera-operator/api/v1alpha1"
+	"github.com/hashemzargari/kimera-operator/internal/naming"
 )
 
 func testEnvironment() *platformv1alpha1.DevelopmentEnvironment {
@@ -29,6 +33,43 @@ func TestDesiredDeploymentConfiguresCodeServerSafely(t *testing.T) {
 	}
 	if deployment.Spec.Template.Spec.SecurityContext.SeccompProfile == nil || deployment.Spec.Template.Spec.SecurityContext.SeccompProfile.Type != corev1.SeccompProfileTypeRuntimeDefault {
 		t.Fatal("expected RuntimeDefault seccomp profile")
+	}
+}
+
+func TestWorkloadSelectorsAreUIDScoped(t *testing.T) {
+	env := testEnvironment()
+	deployment := DesiredDeployment(env)
+	service := DesiredService(env)
+	want := naming.SelectorLabels(env)
+	if !reflect.DeepEqual(deployment.Spec.Selector.MatchLabels, want) {
+		t.Fatalf("Deployment selector = %#v, want %#v", deployment.Spec.Selector.MatchLabels, want)
+	}
+	if !reflect.DeepEqual(service.Spec.Selector, want) {
+		t.Fatalf("Service selector = %#v, want %#v", service.Spec.Selector, want)
+	}
+	for key, value := range want {
+		if deployment.Spec.Template.Labels[key] != value {
+			t.Fatalf("PodTemplate label %q = %q, want %q", key, deployment.Spec.Template.Labels[key], value)
+		}
+	}
+	if deployment.Spec.Template.Labels[naming.AppNameLabel] != naming.AppNameValue {
+		t.Fatal("PodTemplate should retain descriptive app metadata")
+	}
+
+	selector := labels.SelectorFromSet(service.Spec.Selector)
+	podA := labels.Set(deployment.Spec.Template.Labels)
+	podB := maps.Clone(podA)
+	podB[naming.EnvironmentUIDLabel] = "another-environment-uid"
+	missingUID := maps.Clone(podA)
+	delete(missingUID, naming.EnvironmentUIDLabel)
+	if !selector.Matches(podA) {
+		t.Fatal("selector did not match a pod from the current environment instance")
+	}
+	if selector.Matches(podB) {
+		t.Fatal("selector matched a same-name pod from a different environment UID")
+	}
+	if selector.Matches(missingUID) {
+		t.Fatal("selector matched a pod missing the environment UID")
 	}
 }
 

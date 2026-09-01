@@ -15,11 +15,20 @@ const (
 	OriginalEnvironmentUIDAnnotation  = "platform.kimera.dev/original-environment-uid"
 	StorageIdentityAnnotation         = "platform.kimera.dev/storage-identity"
 	ManagedByValue                    = "kimera"
+	AppNameLabel                      = "app.kubernetes.io/name"
+	AppNameValue                      = "development-environment"
 	maxObjectNameLength               = 253
 )
 
-// StorageIdentity is the immutable identity of one DevelopmentEnvironment instance.
-func StorageIdentity(env *platformv1alpha1.DevelopmentEnvironment) string { return string(env.UID) }
+// DevelopmentEnvironmentIdentity is the immutable identity of one API object instance.
+func DevelopmentEnvironmentIdentity(env *platformv1alpha1.DevelopmentEnvironment) string {
+	return string(env.UID)
+}
+
+// StorageIdentity is the storage-specific alias for the environment object's identity.
+func StorageIdentity(env *platformv1alpha1.DevelopmentEnvironment) string {
+	return DevelopmentEnvironmentIdentity(env)
+}
 
 // PVC returns a deterministic claim name tied to the CR UID, not merely its reusable name.
 func PVC(env *platformv1alpha1.DevelopmentEnvironment) string {
@@ -42,8 +51,23 @@ func PVC(env *platformv1alpha1.DevelopmentEnvironment) string {
 func Deployment(env *platformv1alpha1.DevelopmentEnvironment) string { return env.Name }
 func Service(env *platformv1alpha1.DevelopmentEnvironment) string    { return env.Name }
 func Ingress(env *platformv1alpha1.DevelopmentEnvironment) string    { return env.Name }
+
+// SelectorLabels uniquely identify workloads belonging to one environment instance.
+// An environment without an API-assigned UID deliberately has no usable selector.
+func SelectorLabels(env *platformv1alpha1.DevelopmentEnvironment) map[string]string {
+	if env.UID == "" {
+		return nil
+	}
+	return map[string]string{NameLabel: env.Name, EnvironmentUIDLabel: DevelopmentEnvironmentIdentity(env)}
+}
+
+// Labels contains descriptive metadata plus the instance identity when one is available.
 func Labels(env *platformv1alpha1.DevelopmentEnvironment) map[string]string {
-	return map[string]string{NameLabel: env.Name, "app.kubernetes.io/name": "development-environment"}
+	labels := map[string]string{NameLabel: env.Name, AppNameLabel: AppNameValue}
+	if env.UID != "" {
+		labels[EnvironmentUIDLabel] = DevelopmentEnvironmentIdentity(env)
+	}
+	return labels
 }
 
 // PVCLabels identify KIMERA-managed storage and the immutable environment instance it belongs to.

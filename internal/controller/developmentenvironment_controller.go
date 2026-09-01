@@ -96,11 +96,15 @@ func (r *DevelopmentEnvironmentReconciler) Reconcile(ctx context.Context, req ct
 		}
 		return ctrl.Result{}, err
 	}
-	if err := r.reconcileOwned(ctx, env, resources.DesiredDeployment(env)); err != nil {
-		return ctrl.Result{}, fmt.Errorf("reconcile Deployment: %w", err)
-	}
 	if err := r.reconcileOwned(ctx, env, resources.DesiredService(env)); err != nil {
 		return ctrl.Result{}, fmt.Errorf("reconcile Service: %w", err)
+	}
+	deploymentReady, err := r.reconcileDeployment(ctx, env)
+	if err != nil {
+		return ctrl.Result{}, fmt.Errorf("reconcile Deployment: %w", err)
+	}
+	if !deploymentReady {
+		return ctrl.Result{RequeueAfter: time.Second}, nil
 	}
 	if env.Spec.Network.Enabled {
 		if err := r.reconcileOwned(ctx, env, resources.DesiredIngress(env)); err != nil {
@@ -131,6 +135,9 @@ type terminalStorageError struct {
 func (e *terminalStorageError) Error() string { return e.message }
 
 func validateQuantities(env *platformv1alpha1.DevelopmentEnvironment) error {
+	if env.UID == "" {
+		return &specError{"metadata.uid is required to derive safe workload and storage identities"}
+	}
 	for name, value := range map[string]resource.Quantity{"cpuRequest": env.Spec.Resources.CPURequest, "cpuLimit": env.Spec.Resources.CPULimit, "memoryRequest": env.Spec.Resources.MemoryRequest, "memoryLimit": env.Spec.Resources.MemoryLimit, "storage.size": env.Spec.Storage.Size} {
 		if value.Sign() <= 0 {
 			return &specError{fmt.Sprintf("spec.%s must be positive", name)}
@@ -306,6 +313,34 @@ func storageFailure(phase platformv1alpha1.DevelopmentEnvironmentPhase, reason, 
 	return &terminalStorageError{phase: phase, reason: reason, message: message, logMessage: logMessage, logFields: []any{logFieldPVC, pvc.Name, "currentSize", current.String(), "requestedSize", requested.String(), "storageClass", storageClass}}
 }
 
+// reconcileDeployment safely replaces a managed Deployment when its immutable selector
+// differs from desired state. Its UID-derived PVC is never part of this replacement.
+func (r *DevelopmentEnvironmentReconciler) reconcileDeployment(ctx context.Context, env *platformv1alpha1.DevelopmentEnvironment) (bool, error) {
+	desired := resources.DesiredDeployment(env)
+	existing := &appsv1.Deployment{}
+	err := r.Get(ctx, client.ObjectKeyFromObject(desired), existing)
+	if apierrors.IsNotFound(err) {
+		return true, r.reconcileOwned(ctx, env, desired)
+	}
+	if err != nil {
+		return false, fmt.Errorf("get Deployment before selector reconciliation: %w", err)
+	}
+	if !metav1.IsControlledBy(existing, env) {
+		return false, fmt.Errorf("deployment %s/%s already exists but is not controlled by this DevelopmentEnvironment; refusing adoption or replacement", existing.Namespace, existing.Name)
+	}
+	if equality.Semantic.DeepEqual(existing.Spec.Selector, desired.Spec.Selector) {
+		return true, r.reconcileOwned(ctx, env, desired)
+	}
+	if existing.DeletionTimestamp.IsZero() {
+		ctrl.LoggerFrom(ctx).Info("Replacing managed Deployment because immutable selector differs from desired state", "deployment", existing.Name, "environmentUID", env.UID)
+	}
+	done, err := r.deleteAndConfirm(ctx, existing)
+	if err != nil || !done {
+		return done, err
+	}
+	return true, r.reconcileOwned(ctx, env, desired)
+}
+
 func (r *DevelopmentEnvironmentReconciler) reconcileOwned(ctx context.Context, env *platformv1alpha1.DevelopmentEnvironment, desired client.Object) error {
 	expected := desired.DeepCopyObject().(client.Object)
 	// Apply the same built-in Kubernetes defaults the API server applies. Without this,
@@ -411,7 +446,9 @@ func (r *DevelopmentEnvironmentReconciler) setReadiness(ctx context.Context, env
 	if err := r.Get(ctx, types.NamespacedName{Namespace: env.Namespace, Name: naming.Service(env)}, service); err != nil && !apierrors.IsNotFound(err) {
 		return fmt.Errorf("observe Service: %w", err)
 	}
-	serviceReady := service.Name != ""
+	// Phase 1 deliberately treats Service readiness as API-object existence. Endpoint health
+	// is represented by Deployment availability; this controller does not watch EndpointSlices.
+	serviceExists := service.Name != ""
 	networkReady := !env.Spec.Network.Enabled
 	if env.Spec.Network.Enabled {
 		ingress := &networkingv1.Ingress{}
@@ -441,7 +478,7 @@ func (r *DevelopmentEnvironmentReconciler) setReadiness(ctx context.Context, env
 	statusutil.Set(env, statusutil.WorkloadReady, condition(workloadReady), "DeploymentObserved", workloadMessage)
 	statusutil.Set(env, statusutil.NetworkReady, condition(networkReady), "IngressObserved", networkMessage)
 	env.Status.ObservedGeneration = env.Generation
-	allReady := storageReady && workloadReady && serviceReady && networkReady && refsReady
+	allReady := storageReady && workloadReady && serviceExists && networkReady && refsReady
 	if allReady {
 		env.Status.Phase = platformv1alpha1.PhaseReady
 		statusutil.Set(env, statusutil.Ready, metav1.ConditionTrue, "ResourcesReady", "DevelopmentEnvironment is ready")

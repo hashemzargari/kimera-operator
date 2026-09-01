@@ -13,7 +13,8 @@ const IDEPort int32 = 8080
 
 // DesiredDeployment returns the single-replica IDE workload.
 func DesiredDeployment(env *platformv1alpha1.DevelopmentEnvironment) *appsv1.Deployment {
-	labels := naming.Labels(env)
+	metadataLabels := naming.Labels(env)
+	selectorLabels := naming.SelectorLabels(env)
 	replicas := int32(1)
 	noEscalation := false
 	terminationGracePeriod := int64(30)
@@ -26,7 +27,7 @@ func DesiredDeployment(env *platformv1alpha1.DevelopmentEnvironment) *appsv1.Dep
 		envFrom = append(envFrom, corev1.EnvFromSource{SecretRef: &corev1.SecretEnvSource{LocalObjectReference: ref}})
 	}
 	container := corev1.Container{Name: "ide", Image: env.Spec.Image, ImagePullPolicy: corev1.PullIfNotPresent, Args: []string{"--bind-addr", "0.0.0.0:8080", "--auth", "none"}, Ports: []corev1.ContainerPort{{Name: "http", ContainerPort: IDEPort, Protocol: corev1.ProtocolTCP}}, EnvFrom: envFrom, Resources: corev1.ResourceRequirements{Requests: corev1.ResourceList{corev1.ResourceCPU: env.Spec.Resources.CPURequest, corev1.ResourceMemory: env.Spec.Resources.MemoryRequest}, Limits: corev1.ResourceList{corev1.ResourceCPU: env.Spec.Resources.CPULimit, corev1.ResourceMemory: env.Spec.Resources.MemoryLimit}}, SecurityContext: &corev1.SecurityContext{AllowPrivilegeEscalation: &noEscalation, Capabilities: &corev1.Capabilities{Drop: []corev1.Capability{"ALL"}}}, ReadinessProbe: httpProbe("/healthz", 10, 5), LivenessProbe: httpProbe("/healthz", 30, 10), VolumeMounts: []corev1.VolumeMount{{Name: "workspace", MountPath: "/home/coder/project"}}, TerminationMessagePath: corev1.TerminationMessagePathDefault, TerminationMessagePolicy: corev1.TerminationMessageReadFile}
-	return &appsv1.Deployment{ObjectMeta: metav1.ObjectMeta{Name: naming.Deployment(env), Namespace: env.Namespace, Labels: labels}, Spec: appsv1.DeploymentSpec{Replicas: &replicas, Selector: &metav1.LabelSelector{MatchLabels: labels}, Template: corev1.PodTemplateSpec{ObjectMeta: metav1.ObjectMeta{Labels: labels}, Spec: corev1.PodSpec{SecurityContext: &corev1.PodSecurityContext{SeccompProfile: &corev1.SeccompProfile{Type: corev1.SeccompProfileTypeRuntimeDefault}}, Containers: []corev1.Container{container}, Volumes: []corev1.Volume{{Name: "workspace", VolumeSource: corev1.VolumeSource{PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{ClaimName: naming.PVC(env)}}}}, RestartPolicy: corev1.RestartPolicyAlways, TerminationGracePeriodSeconds: &terminationGracePeriod, DNSPolicy: corev1.DNSClusterFirst, SchedulerName: corev1.DefaultSchedulerName, EnableServiceLinks: &enableServiceLinks}}}}
+	return &appsv1.Deployment{ObjectMeta: metav1.ObjectMeta{Name: naming.Deployment(env), Namespace: env.Namespace, Labels: metadataLabels}, Spec: appsv1.DeploymentSpec{Replicas: &replicas, Selector: &metav1.LabelSelector{MatchLabels: selectorLabels}, Template: corev1.PodTemplateSpec{ObjectMeta: metav1.ObjectMeta{Labels: metadataLabels}, Spec: corev1.PodSpec{SecurityContext: &corev1.PodSecurityContext{SeccompProfile: &corev1.SeccompProfile{Type: corev1.SeccompProfileTypeRuntimeDefault}}, Containers: []corev1.Container{container}, Volumes: []corev1.Volume{{Name: "workspace", VolumeSource: corev1.VolumeSource{PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{ClaimName: naming.PVC(env)}}}}, RestartPolicy: corev1.RestartPolicyAlways, TerminationGracePeriodSeconds: &terminationGracePeriod, DNSPolicy: corev1.DNSClusterFirst, SchedulerName: corev1.DefaultSchedulerName, EnableServiceLinks: &enableServiceLinks}}}}
 }
 
 func httpProbe(path string, initialDelay, period int32) *corev1.Probe {
